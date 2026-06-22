@@ -1,0 +1,46 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+
+# 环境变量/密钥文件（关键，避免Token、密码提交）
+.env
+.env.local
+config_secret.py
+secret.ini
+
+# 日志文件
+*.log
+logs/
+log/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# 编辑器缓存
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 编译输出、临时文件
+*.xlsx
+*.xls
+*.tmp
+*.json
+temp/
+dist/
+build/
+
+pyfiles/00通用组件/
+pyfiles/00通用组件/01首页/
+pyfiles/01首页/
+json数据/
+pybackup/
+pyfiles/
