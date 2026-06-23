@@ -1,7 +1,7 @@
 # -*- coding: UTF-8 -*-
 """
 @File    : ZZ_semiproduct_deduct_push.py
-@Author  : your.name@dxdstech.com
+@Author  : yang.zhang@dxdstech.com
 @Date    : 2026/06/22
 @explain : 半成品扣料推送
 
@@ -11,19 +11,19 @@
   接口说明：  半成品扣料推送, 调 SAP 货物移动 RFC(ZRFC_MM_GNRTRANS_RACQ, MB1A),
              移动类型 261(正向发料)/262(反向冲销),
              并将物料凭证号/年度/状态/消息回写至 t_co_summary_result。
+             
   源表:       t_co_summary_report(扣料明细)
   结果表:     t_co_summary_result(过账结果)
-  中间表:     ZMES_MM_GOODSREC  (TODO: 联调确认是否需要先 INSERT 再调 RFC, 见技术处理机制)
+  中间表:     ZMES_MM_GOODSREC (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
 
-  说明: 当前按"只调 RFC"搭骨架, P_HEADER/P_CODE/P_IPINDEX/P_BUKRS/P_ITEM 全部入参,
-        中间表 INSERT(PROCESS_FLG=5) 留 TODO, 等 SAP 联调再定。
 """
 import json
 import traceback
 from datetime import datetime
 
 from DbHelper import DbHelper
-from libenhance import Request, Response
+from libenhance import Request, Response, get_cnf
+from OracleDB import OracleDB, get_schema
 from ToolsMethods import (
     GetExportData,
     Paginator,
@@ -44,7 +44,16 @@ INTERFACE_NAME = "半成品扣料推送接口"
 
 # MES与SAP接口编号 / 中间表
 IP_NO = "MES_MM_004"
-MID_TABLE = "ZMES_MM_GOODSREC"      # 中间表(TODO: 联调确认是否需要先 INSERT, PROCESS_FLG=5)
+MID_TABLE = "ZMES_MM_GOODSREC"            # Oracle 中间表(秘火先 INSERT, 再调 RFC)
+PROCESS_FLG_INIT = "5"                    # 秘火写入中间表时的初始状态(SAP 成功置 2 / 失败置 D)
+MANDT = get_cnf("rfc.client")             # SAP 集团号(=RFC client, 生产 801 / 测试 500)
+
+# 中间表 ZMES_MM_GOODSREC 列(按接口文档 v1.1)
+MID_TABLE_COLUMNS = [
+    "MANDT", "IP_NO", "IP_INDEX", "AUFNR", "ZCOUNT", "BWART", "WERKS", "MATNR",
+    "ERFMG", "ERFME", "CHARG", "ZUSER", "DATUM_B", "UZEIT_B", "ZDATE", "ZTIME",
+    "BUKRS", "USRID", "PROCESS_FLG", "LGORT",
+]
 
 # BAPI 货物移动事务代码 / 公司代码 / 工厂 / 存储地点
 GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
@@ -132,7 +141,7 @@ def semiproduct_deduct_push():
         res.set_body(json.dumps(response))
         res.commit(True)
         return
-
+  
     res_bus = semiproduct_deduct_push_core(
         user_id, task_id, params["year"], params["period"], params["plant_code"]
     )
@@ -142,10 +151,8 @@ def semiproduct_deduct_push():
 
 
 def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
-    """半成品扣料推送 核心逻辑(603 core)
-
+    """半成品扣料推送 核心逻辑(604 core)
     查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态。
-
     :return: {"code", "msg", "data", "display"}
     """
     code, msg = 200, "无可推送记录"
@@ -156,7 +163,6 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
     # 查询待推送记录
     records = get_pending_list(plant_code, year, period)
     print("待推送记录--", records)
-
     # 按 id 去重
     push_dict = {}
     unique_records = []
@@ -165,15 +171,18 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
         if record_id and not push_dict.get(record_id):
             push_dict[record_id] = record
             unique_records.append(record)
-
+    # 文档要求: 正向(261)必须先于反向(262)传送, 同向按 id(创建先后)升序
+    unique_records.sort(key=lambda r: (str(r.get("movement_type")) == MOVE_TYPE_NEG, r.get("id") or 0))
     record_cnt = len(unique_records)
 
-    # ===== 一次性全推送: 所有记录合并成一次货物移动, 一次 RFC 调用 =====
+    # ===== 一次性全推送: 先 INSERT Oracle 中间表, 再一次调 RFC =====
     if record_cnt:
+        ip_index = generate_ipindex()
         try:
-            sap_send_data = prepare_gm_request(unique_records)
-            # TODO(联调): 文档要求先 INSERT 中间表 ZMES_MM_GOODSREC(PROCESS_FLG=5) 再调 RFC,
-            #            当前直接调 RFC, 等 SAP 侧确认后再补 INSERT。
+            # 1) 先把扣料明细写入 SAP 中间表 ZMES_MM_GOODSREC(PROCESS_FLG=5)
+            insert_mid_table(unique_records, ip_index)
+            # 2) 用同一个 IP_INDEX 调 SAP 货物移动 RFC
+            sap_send_data = prepare_gm_request(unique_records, ip_index)
             sap_resp = send_gm_request(sap_send_data)
             resp = extract_gm_response(sap_resp)
             stat = str(resp.get("stat"))
@@ -338,7 +347,7 @@ def semiproduct_deduct_query_data(body):
 def get_pending_list(plant_code, year, period):
     """查询待推送的半成品扣料记录
 
-    TODO(联调): status 的判定与 report↔result 的关联键待确认,
+    TODO(联调): status 的判定与 report与result 的关联键待确认,
               目前按 t_co_summary_report 的 plant/year/period + 移动类型261/262 取,
               并以结果表 status != '2' 作为待推送(关联键待补)。
     :return: list[dict]
@@ -360,13 +369,13 @@ def get_pending_list(plant_code, year, period):
     return data
 
 
-def prepare_gm_request(records):
+def prepare_gm_request(records, ip_index):
     """组装 SAP 货物移动请求(ZRFC_MM_GNRTRANS_RACQ)
 
     入参(按文档):
       P_HEADER  : 抬头 {PSTNG_DATE, DOC_DATE, HEADER_TXT}
       P_CODE    : {GM_CODE: '03'}
-      P_IPINDEX : 序列编码(本批共用一个)
+      P_IPINDEX : 序列编码(与中间表 INSERT 共用同一个)
       P_BUKRS   : 'RACQ'
       P_ITEM    : 行项目表(每条记录一行)
     """
@@ -374,7 +383,6 @@ def prepare_gm_request(records):
         return {}
 
     head_fields = build_gm_header(records)
-    ip_index = generate_ipindex()
     item_table = [build_gm_item(record, idx) for idx, record in enumerate(records, start=1)]
 
     sap_send_data = {
@@ -386,6 +394,68 @@ def prepare_gm_request(records):
     }
     print("组装SAP 货物移动请求数据完成---", sap_send_data)
     return sap_send_data
+
+
+def insert_mid_table(records, ip_index):
+    """把扣料明细写入 Oracle 中间表 ZMES_MM_GOODSREC(PROCESS_FLG=5)
+
+    参考 SummaryCertificate.py 的 `insert all ... select 1 from dual` 写法。
+    一批记录共用同一个 IP_INDEX, 用 ZCOUNT(1..N) 区分行项目。
+    说明: IP_INDEX 每次推送都新生成(generate_ipindex, 时间戳唯一), 不与历史记录冲突,
+          故无需 DELETE 旧记录(Oracle 账号无删除权限); 失败遗留的 PROCESS_FLG=5 行
+          不会被新 IP_INDEX 命中, 不影响重推。
+    :return: 受影响行数; 写入失败抛异常。
+    """
+    schema = get_schema()
+    table = "{schema}.{tbl}".format(schema=schema, tbl=MID_TABLE) if schema else MID_TABLE
+    oracle = OracleDB()
+    try:
+        now = datetime.now()
+        datum, uzeit = now.strftime("%Y%m%d"), now.strftime("%H%M%S")
+
+        insert_sql = "insert all "
+        for idx, record in enumerate(records, start=1):
+            row = {
+                "MANDT": MANDT or "",
+                "IP_NO": IP_NO,
+                "IP_INDEX": ip_index,
+                "AUFNR": record.get("prodosn", ""),
+                # 文档: ZCOUNT ← summary_line(与返回 P_WLPZ.ZEILE 同源); 缺失才用序号兜底
+                "ZCOUNT": record.get("summary_line") if record.get("summary_line") not in (None, "") else idx,
+                "BWART": str(record.get("movement_type") or "").strip() or MOVE_TYPE_POS,
+                "WERKS": record.get("plant_code", "") or PLANT_DEFAULT,
+                "MATNR": record.get("mat_code", ""),
+                "ERFMG": _parse_amount(record.get("consump_qty")),
+                "ERFME": record.get("basic_uom", ""),
+                "CHARG": record.get("batch_sn", ""),
+                "ZUSER": record.get("create_id", ""),
+                "DATUM_B": datum,
+                "UZEIT_B": uzeit,
+                "ZDATE": datum,
+                "ZTIME": uzeit,
+                "BUKRS": BUKRS,
+                "USRID": USRID,
+                "PROCESS_FLG": PROCESS_FLG_INIT,
+                "LGORT": STGE_LOC_DEFAULT,
+            }
+            vals = []
+            for col in MID_TABLE_COLUMNS:
+                v = row[col]
+                if col in ("ERFMG", "ZCOUNT"):
+                    vals.append(str(v))                       # 数值列: 裸数字字面量
+                else:
+                    vals.append(repr(str(v)) if v not in (None, "") else "NULL")
+            insert_sql += " into {t} ({cols}) values ({v}) ".format(
+                t=table, cols=",".join(MID_TABLE_COLUMNS), v=",".join(vals))
+        insert_sql += " select 1 from dual"
+        print(insert_sql)
+
+        row_count = oracle.execute(insert_sql)
+        if not row_count:
+            raise Exception("中间表 {tbl} 写入失败(ip_index={ip})".format(tbl=MID_TABLE, ip=ip_index))
+        return row_count
+    finally:
+        oracle.close()
 
 
 def build_gm_header(records):
@@ -493,6 +563,7 @@ def update_summary_result(records, resp):
         }
         cols = ("associated_doc_sn", "year", "status", "post_account_msg", "update_time")
         update_db_record_by_cond(db, RESULT_TABLE, cond, cols, data)
+    db.dbCommit()
 
 
 # ---------- 工具 ----------
@@ -501,7 +572,7 @@ def _parse_amount(value):
     try:
         return float(value) if value not in (None, "") else 0.0
     except (TypeError, ValueError):
-        return 0.0
+        return 0.0 
 
 
 def _to_ymd(date_value):

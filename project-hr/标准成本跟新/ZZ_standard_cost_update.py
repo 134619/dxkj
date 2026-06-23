@@ -1,6 +1,6 @@
 # -*- coding: UTF-8 -*-
 """
-@File    : ZZEXT_standard_cost_update.py
+@File    : ZZ_standard_cost_update.py
 @Author  : yang.zhang@dxdstech.com
 @Date    : 2026/06/18
 @explain : 标准成本更新
@@ -11,11 +11,24 @@
   接口说明：  标准成本更新, 调SAP (ZBAPI_MATVAL_PRICE_CHANGE)
              将标准成本数据推送至SAP进行更新,
              并将更新结果回写至 t_sap_mmd_standard_price。
+
+  收发方式参照 ZZ_wip_variance_adjust_posting.py:
+    入口 Request().body() 取参, Response.set_body/commit 返回;
+    返回体 {code, msg, data, display}, 查询支持 _payload_ 过滤/排序/分页/导出。
 """
+import json
 import traceback
 from datetime import datetime
 
 from DbHelper import DbHelper
+from libenhance import Request, Response
+from ToolsMethods import (
+    GetExportData,
+    Paginator,
+    create_table_alias,
+    display_to_entozh,
+    generate_raw_sql,
+)
 from utils import query_db_records_by_cond, update_db_record_by_cond
 from ZZEXT_SapRFC import SAPRFC
 
@@ -34,43 +47,102 @@ TABLE_NAME = "t_sap_mmd_standard_price"
 db = DbHelper()
 
 
-def standard_cost_update(payload, user_id):
-    """入口函数: 标准成本更新(按 工厂/年度/期间 批量)
+# ---------- 公共参数校验(posting / query 共用) ----------
+def validate_standard_cost_params(data):
+    """校验标准成本更新接口的公共参数(plant_code / year / period), mat_code 可选
 
-    流程: 查询待更新记录 -> 组装ZBAPI请求 -> 调SAP -> 解析 -> 回写业务表
-    入参:
-    :param user_id: 操作人ID
-    :param payload: 请求参数, data 内含 plant_code/year/period, 可选 mat_code
-    :return:
-    {
-        "type": "S/E",     # S-成功 E-失败
-        "message": "string",
-    }
+    :param data: 请求里的 data 字典(即 body["data"])
+    :return: (is_valid, message, params)
+        params 成功时含 {"plant_code","year","period","mat_code"}; 失败为 {}
     """
-    print(f"===标准成本更新接口=== 处理开始... 参数: {payload}")
+    if not isinstance(data, dict) or not data:
+        return False, "请求数据(data)为空或格式错误", {}
 
-    data = payload.get("data") or payload
+    plant_code = data.get("plant_code")
+    year = data.get("year")
+    period = data.get("period")
 
-    # 参数校验
-    err = check_params(data)
-    if err:
-        return {"type": "E", "message": err}
+    plant_code = plant_code.strip() if isinstance(plant_code, str) else plant_code
+    year = str(year).strip() if year is not None else ""
+    period = str(period).strip() if period is not None else ""
 
-    plant_code = data.get("plant_code", "")
-    year = data.get("year", "")
-    period = data.get("period", "")
+    missing = []
+    if not plant_code:
+        missing.append("plant_code(工厂代码)")
+    if not year:
+        missing.append("year(年度)")
+    if not period:
+        missing.append("period(期间)")
+    if missing:
+        return False, f"缺少必填参数: {'、'.join(missing)}", {}
 
-    # 查询待更新记录(未成功即推)
-    records = get_standard_cost_update_list(plant_code, year, period, data.get("mat_code"))
-    if not records:
-        return {"type": "S", "message": "无可更新记录"}
+    if not (year.isdigit() and len(year) == 4):
+        return False, f"年度(year)应为4位数字, 当前: {year!r}", {}
+    if not period.isdigit():
+        return False, f"期间(period)必须为数字, 当前: {period!r}", {}
+    period_num = int(period)
+    if period_num < 1 or period_num > 12:
+        return False, f"期间(period)必须在1-12之间, 当前: {period}", {}
+    period = f"{period_num:02d}"
 
-    success_cnt = 0
+    mat_code = data.get("mat_code")
+    mat_code = mat_code.strip() if isinstance(mat_code, str) else (mat_code or "")
+
+    params = {"plant_code": str(plant_code), "year": year, "period": period, "mat_code": str(mat_code)}
+    return True, "校验通过", params
+
+
+# 标准成本更新 按钮
+def standard_cost_update():
+    """标准成本更新接口 按钮"""
+    print("===标准成本更新接口===")
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
+    print("body---", body)
+    user_id = req.header("user_id")
+
+    payload = body.get("data") or {}
+    task_id = payload.get("task_id")  # 仅日志关联用, 缺省为 None
+
+    # 公共参数校验, 失败直接返回
+    ok, msg, params = validate_standard_cost_params(payload)
+    if not ok:
+        response = {"code": 500, "type": "E", "msg": msg}
+        print(f"===标准成本更新接口=== 参数校验失败: {msg}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
+        return
+
+    res_bus = standard_cost_update_core(
+        user_id, task_id, params["year"], params["period"], params["plant_code"], params.get("mat_code")
+    )
+    print(f"===标准成本更新接口=== 处理结束!!! 返回: {res_bus}")
+    res.set_body(json.dumps(res_bus))
+    res.commit(True)
+
+
+def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_code=None):
+    """标准成本更新 核心逻辑
+
+    ZBAPI_MATVAL_PRICE_CHANGE 单次只改一个物料价格, 故逐条调用、回写, 最后回查最新状态。
+    :return: {"code", "msg", "data", "display"}
+    """
+    code, msg = 200, "无可更新记录"
+    body = {"data": {"year": year, "period": period, "plant_code": plant_code, "mat_code": mat_code or ""}}
+    print(f"===标准成本更新 core=== user_id={user_id} task_id={task_id} "
+          f"plant_code={plant_code} {year}-{period} mat_code={mat_code or ''}")
+
+    # 查询待更新记录(posting_status != 'S')
+    records = get_standard_cost_update_list(plant_code, year, period, mat_code)
+    print("待更新记录--", records)
+
+    resp_code_list = []
     fail_msgs = []
     for record in records:
-        mat_code = record.get("mat_code", "")
+        mat = record.get("mat_code", "")
         try:
-            # 组装并发送
+            # 组装并发送(单物料)
             sap_send_data = prepare_price_change_request(record)
             sap_resp = send_price_change_request(sap_send_data)
             # 解析
@@ -78,13 +150,16 @@ def standard_cost_update(payload, user_id):
             # 回写
             update_standard_price(record, resp, user_id)
 
-            if resp.get("p_ret") == "2":
-                success_cnt += 1
+            if str(resp.get("p_ret")) == "2":
+                resp_code_list.append(200)
             else:
-                fail_msgs.append(f"{mat_code}: {resp.get('p_msg') or 'SAP返回失败'}")
+                resp_code_list.append(206)
+                each_msg = f"{mat}: {resp.get('p_msg') or 'SAP返回失败'}"
+                fail_msgs.append(each_msg)
         except Exception as e:
             traceback.print_exc()
-            fail_msgs.append(f"{mat_code}: {e}")
+            resp_code_list.append(206)
+            fail_msgs.append(f"{mat}: {e}")
             # 异常时把该条置为失败
             update_standard_price(record, {
                 "ml_doc_num": "",
@@ -93,118 +168,163 @@ def standard_cost_update(payload, user_id):
             }, user_id)
 
     total = len(records)
-    if not fail_msgs:
-        response = {"type": "S", "message": f"更新成功 {success_cnt} 条"}
+    if total and not fail_msgs:
+        code, msg = 200, f"更新成功 {total} 条"
+    elif fail_msgs:
+        code = 206
+        fail_cnt = sum(1 for c in resp_code_list if c != 200)
+        succ_cnt = len(resp_code_list) - fail_cnt
+        msg = (f"共 {total} 条, 成功 {succ_cnt} 条, 失败 {fail_cnt} 条; "
+               f"失败明细: {'; '.join(fail_msgs)}")
+
+    # 回查最终状态(供前端刷新表格)
+    data, display = standard_cost_update_query_data(body)
+    return {"code": code, "msg": msg, "data": data, "display": display}
+
+
+# 标准成本更新 查询接口
+def standard_cost_update_query():
+    """标准成本更新查询接口
+    支持 _payload_ 里的 filter_info / sort_info / page / export_excel
+    """
+    print("===标准成本更新查询接口===")
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
+    print("body----", body)
+
+    # 公共参数校验(plant_code/year/period), 失败直接返回
+    ok, msg, _ = validate_standard_cost_params(body.get("data") or {})
+    if not ok:
+        response = {"code": 500, "type": "E", "msg": msg}
+        print(f"===标准成本更新查询接口=== 参数校验失败: {msg}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
+        return
+
+    payload = body.get("_payload_", {})
+    filter_info = payload.get("filter_info", {})
+    sort_info = payload.get("sort_info", {})
+    export_excel = payload.get("export_excel")
+
+    query_data, display = standard_cost_update_query_data(body)
+    if export_excel:
+        stamp_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+        excel_filename = f"标准成本更新-{stamp_suffix}.xlsx"
+        format_data = [{"sheet1": query_data}]
+        field_dict = display_to_entozh(display)
+        GetExportData(format_data, excel_filename, field_dict)
     else:
+        page_size = payload.get("page", {}).get("page_size", 0)
+        page_num = payload.get("page", {}).get("page_num", 1)
+        paginator = Paginator(query_data, page_size)
+        page_items = paginator.get_page(page_num)
+        total_pages = paginator.total_pages
+        data_sum = len(query_data)
+
         response = {
-            "type": "E",
-            "message": f"共 {total} 条, 成功 {success_cnt} 条, 失败 {len(fail_msgs)} 条; "
-                       f"失败明细: {'; '.join(fail_msgs)}",
+            "code": 200,
+            "msg": "成功",
+            "data": page_items,
+            "page": {
+                "page_size": page_size if page_size else len(query_data),
+                "page_num": page_num,
+                "page_sum": total_pages,
+                "data_sum": data_sum,
+            },
+            "rule": {"sort_info": sort_info, "filter_info": filter_info},
+            "display": display,
         }
-    print(f"===标准成本更新接口=== 处理结束!!! 返回: {response}")
-    return response
+        print(f"===标准成本更新查询接口=== 处理结束!!! 返回: {response}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
 
 
-def standard_cost_update_for_api(payload, user_id):
-    """postman调试入口(脚本调用使用 standard_cost_update)
-
-    :param payload: 字典
-    {
-        "guid": "string",
-        "data": {
-            "plant_code": "string",   # 工厂代码
-            "year": "string",         # 年度
-            "period": "string",       # 期间
-            "mat_code": "string"      # 物料编码(可选, 用于只更新指定物料)
-        }
-    }
-    :param user_id: 用户ID
-    :return: {"guid":"", "type":"S/E", "message":""}
+# 标准成本更新 查询核心逻辑(查询接口/导出/更新回查复用)
+def standard_cost_update_query_data(body):
+    """查 t_sap_mmd_standard_price 标准成本明细
+    :return: (query_data, display)
     """
-    data = payload.get("data")
-    if not data or not isinstance(data, dict):
-        return {"type": "E", "message": "请求数据为空"}
+    data_filter = body.get("data") or {}
+    payload = body.get("_payload_", {})
+    filter_info = payload.get("filter_info", {})
+    sort_info = payload.get("sort_info", {})
 
-    response = standard_cost_update(payload, user_id)
-    response["guid"] = payload.get("guid", "")
-    return response
+    # 前置筛选: 工厂/年度/期间/物料/过账状态/标准成本编码
+    prefix_filter = {}
+    for field in ("plant_code", "year", "period", "mat_code", "posting_status", "std_cost_code"):
+        val = data_filter.get(field)
+        if val not in (None, ""):
+            prefix_filter[field] = val
 
+    columns = '''`id`,
+                `company_code`,
+                `plant_code`,
+                `year`,
+                `period`,
+                `std_cost_code`,
+                `calc_mode`,
+                `effective_start_date`,
+                `effective_end_date`,
+                `posting_date`,
+                `mat_code`,
+                `standard_cost_bc`,
+                `basic_currency`,
+                `price_unit`,
+                `basic_uom`,
+                `posting_status`,
+                `price_doc_sn`,
+                `note`,
+                `update_id`,
+                `update_time`'''
 
-def standard_cost_update_query(payload, user_id):
-    """标准成本更新 查询接口
+    query_sql = f'''
+            SELECT
+                {columns}
+            FROM
+                `{TABLE_NAME}`
+            WHERE 1
+        '''
 
-    入参:
-    :param payload: 请求参数, data 内含 plant_code/year/period,
-                    可选 mat_code/posting_status/std_cost_code
-    :return:
-    {
-        "type": "S/E",     # S-成功 E-失败
-        "message": "string",
-        "data": [ {...}, ... ],
-    }
-    """
-    print(f"===标准成本更新查询接口=== 参数: {payload}")
-    data = payload.get("data") or payload
-    plant_code = data.get("plant_code", "")
-    year = data.get("year", "")
-    period = data.get("period", "")
-    mat_code = data.get("mat_code", "")
-    posting_status = data.get("posting_status", "")
-    std_cost_code = data.get("std_cost_code", "")
+    table_alias = create_table_alias(columns)
+    where_sql, sort_sql = generate_raw_sql(prefix_filter, filter_info, sort_info, table_alias)
+    if not sort_sql:
+        sort_sql = " ORDER BY `id` ASC"
+    if where_sql:
+        where_sql = where_sql.replace("WHERE ", " AND ")
+        full_query_sql = query_sql + where_sql + sort_sql
+    else:
+        full_query_sql = query_sql + sort_sql
 
-    cond = ""
-    if plant_code:
-        cond += f" AND `plant_code`='{plant_code}'"
-    if year:
-        cond += f" AND `year`='{year}'"
-    if period:
-        cond += f" AND `period`='{period}'"
-    if mat_code:
-        cond += f" AND `mat_code`='{mat_code}'"
-    if posting_status:
-        cond += f" AND `posting_status`='{posting_status}'"
-    if std_cost_code:
-        cond += f" AND `std_cost_code`='{std_cost_code}'"
-    if not cond:
-        return {"type": "E", "message": "请至少指定查询条件(plant_code/year/period)", "data": []}
-    cond += " ORDER BY `id` ASC"
+    full_query_sql = full_query_sql.replace("    ", " ").strip()
+    print(full_query_sql)
+    query_data = db.query_sql(full_query_sql)
 
-    # 显式指定列名(禁止使用*), 字段加反引号
-    cols = (
-        "`id`,`company_code`,`plant_code`,`year`,`period`,`std_cost_code`,"
-        "`calc_mode`,`effective_start_date`,`effective_end_date`,`posting_date`,"
-        "`mat_code`,`standard_cost_bc`,`basic_currency`,`price_unit`,`basic_uom`,"
-        "`posting_status`,`price_doc_sn`,`note`,`update_id`,`update_time`"
-    )
+    display = [
+        {"field": "std_cost_code", "description": "标准成本编码"},
+        {"field": "company_code", "description": "公司代码"},
+        {"field": "plant_code", "description": "工厂代码"},
+        {"field": "year", "description": "年度"},
+        {"field": "period", "description": "期间"},
+        {"field": "calc_mode", "description": "计算模式"},
+        {"field": "effective_start_date", "description": "生效开始日期"},
+        {"field": "effective_end_date", "description": "生效结束日期"},
+        {"field": "posting_date", "description": "过账日期"},
+        {"field": "mat_code", "description": "物料编码"},
+        {"field": "standard_cost_bc", "description": "单位标准成本(本位币)"},
+        {"field": "basic_currency", "description": "本位币"},
+        {"field": "price_unit", "description": "价格单位"},
+        {"field": "basic_uom", "description": "基本单位"},
+        {"field": "posting_status", "description": "过账状态"},
+        {"field": "price_doc_sn", "description": "价格更改凭证号"},
+        {"field": "note", "description": "备注"},
+        {"field": "update_time", "description": "更新时间"},
+    ]
 
-    try:
-        records = query_db_records_by_cond(db, TABLE_NAME, cond, cols)
-        response = {"type": "S", "message": f"查询成功, 共 {len(records)} 条", "data": records}
-    except Exception as e:
-        traceback.print_exc()
-        response = {"type": "E", "message": str(e), "data": []}
-    print(f"===标准成本更新查询接口=== 处理结束!!! 返回: {response}")
-    return response
-
-
-def check_params(data):
-    """
-    检查参数是否完整
-    :param data: 请求参数(data体)
-    :return: 错误信息(为空表示校验通过)
-    """
-    plant_code = data.get("plant_code", "")
-    year = data.get("year", "")
-    period = data.get("period", "")
-    if not plant_code:
-        return "缺少工厂代码(plant_code)"
-    if not year:
-        return "缺少年度(year)"
-    if not period:
-        return "缺少期间(period)"
-    return ""
+    return query_data, display
 
 
+# ---------- SAP 价格变更 查询待更新/组装/发送/解析/回写 ----------
 def get_standard_cost_update_list(plant_code, year, period, mat_code=None):
     """查询待更新的标准成本记录(posting_status != 'S')
     :return: list[dict]
@@ -218,7 +338,6 @@ def get_standard_cost_update_list(plant_code, year, period, mat_code=None):
     if mat_code:
         cond += f" AND `mat_code`='{mat_code}'"
     cond += " ORDER BY `id` ASC"
-    # 显式指定列名(禁止使用*), 字段加反引号
     cols = (
         "`id`,`std_cost_code`,`mat_code`,`plant_code`,"
         "`standard_cost_bc`,`basic_currency`,`price_unit`"
@@ -228,12 +347,11 @@ def get_standard_cost_update_list(plant_code, year, period, mat_code=None):
 
 def prepare_price_change_request(record):
     """组装 ZBAPI_MATVAL_PRICE_CHANGE 请求数据
-
-    价格明细(PRICECHANGE)需同时传两种货币类型:
+    价格明细表(PRICES)需同时传两种货币类型:
       10=公司代码货币, 30=集团公司记账货币
     秘火侧仅有本位币(basic_currency)与单位标准成本(standard_cost_bc),
     故两种货币类型行暂传相同的价格/货币(若集团币不同需在此扩展)。
-    :return: dict 顶层扁平结构 + PRICECHANGE 表(两行)
+    :return: dict 顶层扁平结构 + PRICES 表(两行)
     """
     price = _parse_amount(record.get("standard_cost_bc"))
     currency = record.get("basic_currency", "") or ""
@@ -254,7 +372,7 @@ def prepare_price_change_request(record):
         "MATERIAL": record.get("mat_code", ""),         # 物料编码
         "VALUATIONAREA": record.get("plant_code", ""),  # 估价范围=工厂代码
         "P_RELEASE": P_RELEASE,                         # 需要解冻物料时传X
-        "PRICECHANGE": price_change_rows,               # 价格变更明细(两行)
+        "PRICES": price_change_rows,                    # 价格明细表(两行, 10/30)
     }
 
 
@@ -268,20 +386,21 @@ def send_price_change_request(sap_send_data):
 def extract_price_change_response(sap_resp):
     """解析SAP返回数据
 
-    响应字段(顶层, 缺失回退 DATA):
-      P_RET(2成功/3失败) P_MSG(详情) ML_DOC_NUM(价格更改凭证号) ML_DOC_YEAR(库存年度)
+    响应字段位置:
+      P_RET(2成功/3失败) / P_MSG(详情)        -> 顶层单参数
+      ML_DOC_NUM(价格更改凭证号) / ML_DOC_YEAR -> 输出结构行 PRICECHANGEDOCUMENT
     :return: dict {p_ret, p_msg, ml_doc_num, ml_doc_year}
     """
     sap_resp = sap_resp or {}
     data = sap_resp.get("DATA") or {}
+    price_doc = sap_resp.get("PRICECHANGEDOCUMENT") or {}   # 输出结构行
 
     def pick(*keys, default=""):
         for k in keys:
-            val = sap_resp.get(k)
-            if val is None or val == "":
-                val = data.get(k)
-            if val is not None and val != "":
-                return val
+            for src in (sap_resp, price_doc, data):
+                val = src.get(k)
+                if val not in (None, ""):
+                    return val
         return default
 
     return {

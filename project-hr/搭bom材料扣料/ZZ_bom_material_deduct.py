@@ -1,7 +1,7 @@
 # -*- coding: UTF-8 -*-
 """
 @File    : ZZ_bom_material_deduct.py
-@Author  : your.name@dxdstech.com
+@Author  : yang.zhang@dxdstech.com
 @Date    : 2026/06/22
 @explain : 搭BOM材料扣料
 
@@ -11,14 +11,11 @@
   接口说明：  搭BOM材料扣料, 调 SAP 货物移动 RFC(ZRFC_MM_GNRTRANS_RACQ, MB1A),
              移动类型 201/Y01(正向领用)/202/Y02(反向冲销),
              并将物料凭证号/年度/状态/消息回写至 t_co_summary_result。
+
   源表:       t_co_summary_report(扣料明细)
   结果表:     t_co_summary_result(过账结果)
   中间表:     ZMES_MM_GNRTRANS (TODO: 联调确认是否需要先 INSERT 再调 RFC, 见技术处理机制)
 
-  说明: 当前按"只调 RFC"搭骨架, P_HEADER/P_CODE/P_IPINDEX/P_BUKRS/P_ITEM 全部入参,
-        中间表 INSERT(PROCESS_FLG=5) 留 TODO, 等 SAP 联调再定。
-        与半成品扣料的差异: 中间表/接口编号/移动类型不同, P_ITEM 用
-        COSTCENTER(成本中心)+GL_ACCOUNT(成本要素), 无 ORDERID。
 """
 import json
 import traceback
