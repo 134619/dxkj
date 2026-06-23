@@ -217,74 +217,6 @@ def wip_variance_adjust_posting_core(user_id, task_id, year, period, plant_code)
             }
             for record in unique_records:
                 update_manufacturing_adjust(record, fail_resp)
-
-    # ===== 原"逐条推送"逻辑(已改为一次性全推送, 注释保留备查, 勿删) =====
-    # 注: 这里 p_ret/p_msg 用小写, 与 extract_miro_response 返回的键一致。
-    # resp_code_list = []
-    # fail_msgs = []
-    # if records:
-    #     push_dict = {}
-    #     for record in records:
-    #         record_id = record.get("id")
-    #         # 按 id 去重, 避免同一记录重复推送
-    #         if push_dict.get(record_id):
-    #             continue
-    #         else:
-    #             push_dict[record_id] = record
-    #         summary_unique_number = record.get("summary_unique_number", "")
-    #         try:
-    #             # 组装并发送 SAP MIRO
-    #             sap_send_data = prepare_miro_request(record)
-    #             # 调用SAPRFC，推送到RFC接口
-    #             sap_resp = send_miro_request(sap_send_data)
-    #             # 解析SAPRFC返回结果
-    #             resp = extract_miro_response(sap_resp)
-    #             # 回写发票号/年度/备注/过账状态
-    #             update_manufacturing_adjust(record, resp)
-    #             if resp.get("p_ret") == "2":
-    #                 resp_code_list.append(200)
-    #             else:
-    #                 resp_code_list.append(206)
-    #                 each_msg = f"{summary_unique_number}: {resp.get('p_msg') or 'SAP返回失败'}"
-    #                 fail_msgs.append(each_msg)
-    #                 msg = each_msg
-    #         except Exception as e:
-    #             traceback.print_exc()
-    #             resp_code_list.append(206)
-    #             each_msg = f"{summary_unique_number}: {e}"
-    #             fail_msgs.append(each_msg)
-    #             msg = each_msg
-    #             # 异常时把该条置为失败
-    #             update_manufacturing_adjust(record, {
-    #                 "invoice_doc_number": "",
-    #                 "fiscal_year": "",
-    #                 "p_msg": str(e),
-    #                 "p_ret": "3",
-    #             })
-    #
-    # # 回查最终状态(供前端刷新表格)
-    # data, display = wip_variance_adjust_query_data(body)
-    #
-    # update_flag = True
-    # if data:
-    #     for item in data:
-    #         posting_status = str(item.get("posting_status") or "").strip()
-    #         if posting_status != "2":
-    #             print(item)
-    #             update_flag = False
-    #             break
-    #
-    # if update_flag:
-    #     code, msg = 200, "成功"
-    # elif any(c != 200 for c in resp_code_list):
-    #     code = 206
-    #     fail_cnt = sum(1 for c in resp_code_list if c != 200)
-    #     succ_cnt = len(resp_code_list) - fail_cnt
-    #     msg = (f"共 {len(resp_code_list)} 条, 成功 {succ_cnt} 条, 失败 {fail_cnt} 条; "
-    #            f"失败明细: {'; '.join(fail_msgs)}")
-    # else:
-    #     code, msg = 200, "成功"
-
     # 回查最终状态(供前端刷新表格)
     data, display = wip_variance_adjust_query_data(body)
 
@@ -294,12 +226,12 @@ def wip_variance_adjust_posting_core(user_id, task_id, year, period, plant_code)
 # 在制差异调整 查询接口
 def wip_variance_adjust_query():
     """在制差异调整查询接口
-    支持 _payload_ 里的 filter_info / sort_info / page / export_excel
+    支持 _payload_ 里的 filter_info / sort_info / page / export_excel; 默认按 update_time 倒序, 每页 100 条
     :return:
     {
         "code": 200,
         "msg": "成功",
-        "data": [ {...}, ... ],          # 当前页数据
+        "data": [ {...}, ... ],          # 当前页数据(默认按 update_time 倒序)
         "page": { "page_size", "page_num", "page_sum", "data_sum" },
         "rule": { "sort_info", "filter_info" },
         "display": [ {"field", "description"}, ... ]
@@ -321,7 +253,7 @@ def wip_variance_adjust_query():
         res.commit(True)
         return
 
-    # 用标准化参数回写 data, 保证查询条件与过账一致(如期间补零)
+    # 用标准化参数回写 data, 保证查询条件与过账一致
     # body["data"] = {**(body.get("data") or {}), **params}
 
     payload = body.get('_payload_', {})
@@ -338,7 +270,7 @@ def wip_variance_adjust_query():
         field_dict = display_to_entozh(display)
         GetExportData(format_data, excel_filename, field_dict)
     else:
-        page_size = payload.get('page', {}).get('page_size', 0)
+        page_size = payload.get('page', {}).get('page_size') or 100   # 默认每页 100 条
         page_num = payload.get('page', {}).get('page_num', 1)
         paginator = Paginator(query_data, page_size)
         page_items = paginator.get_page(page_num)
@@ -348,12 +280,12 @@ def wip_variance_adjust_query():
         response = {
             "code": 200,
             "msg": "成功",
-            "data": page_items,
+            "data": page_items,              # 当前页数据(默认按 update_time 倒序)
             "page": {
-                "page_size": page_size if page_size else len(query_data),  # 每页数据行数
-                "page_num": page_num,  # 当前页
-                "page_sum": total_pages,  # 总页数
-                "data_sum": data_sum  # 总数据行数
+                "page_size": page_size,      # 每页数据行数
+                "page_num": page_num,         # 当前页
+                "page_sum": total_pages,      # 总页数
+                "data_sum": data_sum          # 总数据行数
             },
             "rule": {
                 "sort_info": sort_info,
@@ -361,8 +293,6 @@ def wip_variance_adjust_query():
             },
             "display": display
         }
-
-
         print(f"===在制差异调整查询接口=== 处理结束!!! 返回: {response}")
         res.set_body(json.dumps(response))
         res.commit(True)
@@ -434,7 +364,8 @@ def wip_variance_adjust_query_data(body):
     table_alias = create_table_alias(columns)
     where_sql, sort_sql = generate_raw_sql(prefix_filter, filter_info, sort_info, table_alias)
     if not sort_sql:
-        sort_sql = ' ORDER BY `id` ASC'
+        # 默认按更新时间倒序(最新过账的在前), id 倒序兜底
+        sort_sql = ' ORDER BY `update_time` DESC, `id` DESC'
     if where_sql:
         where_sql = where_sql.replace('WHERE ', ' AND ')
         full_query_sql = query_sql + where_sql + sort_sql
@@ -656,19 +587,21 @@ def extract_miro_response(sap_resp):
     }
 
 def update_manufacturing_adjust(record, resp):
-    """回写 t_co_manufacturing_adjust: 发票号/年度/备注/过账状态"""
+    """回写 t_co_manufacturing_adjust: 发票号/年度/备注/过账状态/更新时间"""
     record_id = record.get("id")
     if not record_id:
         return
     cond = f" AND `id`={record_id}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if resp.get("p_ret") == "2":
         data = {
             "fi_document_number": resp.get("invoice_doc_number", ""),
             "year": resp.get("fiscal_year", ""),
             "note": resp.get("p_msg", ""),
             "posting_status": resp.get("p_ret"),
+            "update_time": now_str,
         }
-        cols = ("fi_document_number", "year", "note", "posting_status")
+        cols = ("fi_document_number", "year", "note", "posting_status", "update_time")
 
     # 失败的话sap年度会返回0000，失败就不跟跟新年份了
     else:
@@ -676,8 +609,9 @@ def update_manufacturing_adjust(record, resp):
             "fi_document_number": resp.get("invoice_doc_number", ""),
             "note": resp.get("p_msg", ""),
             "posting_status": resp.get("p_ret", "3"),
+            "update_time": now_str,
         }
-        cols = ("fi_document_number", "note", "posting_status")
+        cols = ("fi_document_number", "note", "posting_status", "update_time")
 
     print("回写数据库数据---",data)
     update_db_record_by_cond(db, "t_co_manufacturing_adjust", cond, cols, data)
