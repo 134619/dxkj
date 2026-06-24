@@ -27,6 +27,7 @@ from OracleDB import OracleDB, get_schema
 from ToolsMethods import (
     GetExportData,
     Paginator,
+    calc_time,
     create_table_alias,
     display_to_entozh,
     generate_raw_sql,
@@ -35,7 +36,6 @@ from utils import query_db_records_by_cond, update_db_record_by_cond
 from ZZEXT_SapRFC import SAPRFC
 
 db = DbHelper()
-
 
 # ---------- 固定值(按接口文档 v1.1, 集中维护) ----------
 # SAP接口编码 / RFC函数名
@@ -119,6 +119,7 @@ def validate_deduct_params(data):
 
 
 # 半成品扣料推送 按钮
+@calc_time
 def semiproduct_deduct_push():
     """半成品扣料推送接口 按钮
     task_id 603
@@ -150,6 +151,7 @@ def semiproduct_deduct_push():
     res.commit(True)
 
 
+@calc_time
 def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
     """半成品扣料推送 核心逻辑(604 core)
     查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态。
@@ -171,10 +173,12 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
         if record_id and not push_dict.get(record_id):
             push_dict[record_id] = record
             unique_records.append(record)
-    # 文档要求: 正向(261)必须先于反向(262)传送, 同向按 id(创建先后)升序
+    # 正向(261)必须先于反向(262)传送, 同向按 id(创建先后)升序
     unique_records.sort(key=lambda r: (str(r.get("movement_type")) == MOVE_TYPE_NEG, r.get("id") or 0))
-    record_cnt = len(unique_records)
 
+
+    print("去重后记录--", unique_records)
+    record_cnt = len(unique_records)
     # ===== 一次性全推送: 先 INSERT Oracle 中间表, 再一次调 RFC =====
     if record_cnt:
         ip_index = generate_ipindex()
@@ -186,10 +190,8 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
             sap_resp = send_gm_request(sap_send_data)
             resp = extract_gm_response(sap_resp)
             stat = str(resp.get("stat"))
-
             # 整批共用一个物料凭证号, 逐条回写
             update_summary_result(unique_records, resp)
-
             if stat == "2":
                 code, msg = 200, f"推送成功 {record_cnt} 条"
             else:
@@ -203,14 +205,13 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
             # 异常时把整批置为失败
             fail_resp = {"mat_doc": "", "doc_year": "", "msg": str(e), "stat": "D"}
             update_summary_result(unique_records, fail_resp)
-
     # 回查最终状态(供前端刷新表格)
     data, display = semiproduct_deduct_query_data(body)
-
     return {"code": code, "msg": msg, "data": data, "display": display}
 
 
 # 半成品扣料 查询接口
+@calc_time
 def semiproduct_deduct_query():
     """半成品扣料查询接口
     支持 _payload_ 里的 filter_info / sort_info / page / export_excel
@@ -307,7 +308,7 @@ def semiproduct_deduct_query_data(body):
                 {columns}
             FROM
                 `{SOURCE_TABLE}`
-            WHERE 1
+            WHERE 1=1
         '''
 
     table_alias = create_table_alias(columns)
@@ -319,7 +320,6 @@ def semiproduct_deduct_query_data(body):
         full_query_sql = query_sql + where_sql + sort_sql
     else:
         full_query_sql = query_sql + sort_sql
-
     full_query_sql = full_query_sql.replace("    ", " ").strip()
     print(full_query_sql)
     query_data = db.query_sql(full_query_sql)
@@ -399,7 +399,6 @@ def prepare_gm_request(records, ip_index):
 def insert_mid_table(records, ip_index):
     """把扣料明细写入 Oracle 中间表 ZMES_MM_GOODSREC(PROCESS_FLG=5)
 
-    参考 SummaryCertificate.py 的 `insert all ... select 1 from dual` 写法。
     一批记录共用同一个 IP_INDEX, 用 ZCOUNT(1..N) 区分行项目。
     说明: IP_INDEX 每次推送都新生成(generate_ipindex, 时间戳唯一), 不与历史记录冲突,
           故无需 DELETE 旧记录(Oracle 账号无删除权限); 失败遗留的 PROCESS_FLG=5 行
@@ -492,7 +491,7 @@ def build_gm_item(record, idx):
 def generate_ipindex():
     """生成 IP_INDEX: HMH + YYYYMMDD + 5位流水
 
-    TODO(联调): 流水号需保证全局唯一, 正式应取中间表最大流水+1 或独立序列;
+       流水号需保证全局唯一, 正式应取中间表最大流水+1 或独立序列;
                这里先用时间戳末5位兜底, 仅供联调。
     """
     now = datetime.now()

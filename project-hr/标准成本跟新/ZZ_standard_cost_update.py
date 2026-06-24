@@ -283,7 +283,7 @@ def standard_cost_update_query_data(body):
                 {columns}
             FROM
                 `{TABLE_NAME}`
-            WHERE 1
+            WHERE 1=1
         '''
 
     table_alias = create_table_alias(columns)

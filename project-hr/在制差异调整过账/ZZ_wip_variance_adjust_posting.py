@@ -21,6 +21,7 @@ from libenhance import Request, Response
 from ToolsMethods import (
     GetExportData,
     Paginator,
+    calc_time,
     create_table_alias,
     display_to_entozh,
     generate_raw_sql,
@@ -120,6 +121,7 @@ def validate_wip_variance_params(data):
 
 
 # 推送到RFC接口: wip_variance_adjust_posting
+@calc_time
 def wip_variance_adjust_posting():
     """在制差异调整过账接口 按钮
     task_id 602
@@ -151,6 +153,7 @@ def wip_variance_adjust_posting():
     res.commit(True)
 
 
+@calc_time
 def wip_variance_adjust_posting_core(user_id, task_id, year, period, plant_code):
     """在制差异调整过账 核心逻辑(602 core)
 
@@ -224,6 +227,7 @@ def wip_variance_adjust_posting_core(user_id, task_id, year, period, plant_code)
 
 
 # 在制差异调整 查询接口
+@calc_time
 def wip_variance_adjust_query():
     """在制差异调整查询接口
     支持 _payload_ 里的 filter_info / sort_info / page / export_excel; 默认按 update_time 倒序, 每页 100 条
@@ -358,7 +362,7 @@ def wip_variance_adjust_query_data(body):
                 {columns}
             FROM
                 `t_co_manufacturing_adjust`
-            WHERE 1
+            WHERE 1=1
         '''
 
     table_alias = create_table_alias(columns)
