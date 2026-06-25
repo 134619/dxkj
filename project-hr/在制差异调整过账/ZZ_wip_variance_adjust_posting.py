@@ -44,17 +44,19 @@ COMP_CODE = "RACQ"           # 公司代码
 BUKRS = COMP_CODE            # SAP请求外层公司代码(=COMP_CODE)
 CURRENCY = "CNY"             # 货币码
 CURRENCY_ISO = "CNY"         # ISO货币码
-DIFF_INV = "51591"           # 出票方(虚拟供应商代码), 前端未传入时先用此测试值
+# DIFF_INV = "51591"           # 出票方(虚拟供应商代码), 前端未传入时先用此测试值
+DIFF_INV = "0000111702"           # 出票方(虚拟供应商代码), 前端未传入时先用此测试值
+
 HEADER_ITEM_TEXT = ""        # 抬头项目文本
 
 # 行项目固定值
-GL_ACCOUNT = "4120070003"    # 在制品差异科目, 前端未传入时先用此测试值
+GL_ACCOUNT = "4120070003"    # 在制品差异科目
 TAX_CODE = "J0"              # 税码
 GL_ITEM_NO = "000001"        # GL行发票凭证项目号(固定)
 MAT_ITEM_NO = "000002"       # 物料行发票凭证项目号(固定)
 QUANTITY = 1                 # 物料行数量(测试先写死为1, 多条时解开)
-BASE_UOM = ""                # 基本计量单位(可选, 物料基本单位)
-BASE_UOM_ISO = ""            # ISO计量单位(可选)
+BASE_UOM = "EA"                # 基本计量单位(可选, 物料基本单位)
+BASE_UOM_ISO = "EA"            # ISO计量单位(可选)
 
 # sap_send_data 请求格式(ZBAPI_INCOMINGINVOICE_CREATE, 结构/表 分开):
 #   {"HEADERDATA": 抬头dict, "GLACCOUNTDATA": [GL行dict], "MATERIALDATA": [物料行dict]}
@@ -430,7 +432,7 @@ def get_wip_variance_adjust_list(plant_code, year, period):
         f" ORDER BY `id` ASC"
     )
 
-    cols = "`id`,`summary_unique_number`,`summary_line`,`summary_date`,`prd_mat_code`,`plant_code`,`year`,`amount_diff`,`posting_status`"
+    cols = "`id`,`summary_unique_number`,`summary_line`,`summary_date`,`prd_mat_code`,`plant_code`,`year`,`amount_diff`,`posting_status`,`comp_amount_diff`"
     data = query_db_records_by_cond(db, "t_co_manufacturing_adjust", cond, cols)
     print("查询待过账的在制差异调整记录--",data)
     return data
@@ -537,6 +539,8 @@ def build_miro_material_fields(record):
     ITEM_AMOUNT 取 comp_amount_diff(完工金额差异, 与 GL 行的 amount_diff 区分);
     DB_CR_IND: 差额正数->H(贷), 差额负数->S(借)   (与GL相反, 保持借贷平衡)
     """
+    print("record--------", record)
+    print("comp_amount_diff--------", record.get("comp_amount_diff"))
     amount = _parse_amount(record.get("comp_amount_diff"))
     db_cr_ind = "H" if amount >= 0 else "S"
 
@@ -632,6 +636,7 @@ def _parse_amount(value):
 def _to_ymd(date_value):
     """把日期值格式化为 YYYYMMDD, 失败返回空串"""
     if not date_value:
+
         return ""
     # 兼容 datetime / 字符串
     if isinstance(date_value, datetime):
@@ -641,3 +646,42 @@ def _to_ymd(date_value):
         return text[:8]
     except Exception:
         return ""
+
+
+
+Text_semiproduct_deduct_push_payload = {'data': {'id': 24, 'task_code': '1780905368759', 
+'step': '09-00', 'task_id': 602, 'up_task_id': 0, 
+'step_name': '在制差异调整过账', 'status': '1', 'excute_user': '', 
+'operator_time': '', 'create_id': 1004, 'create_time': '2026-06-18 16:01:29', 
+'update_id': 1004, 'update_time': '2026-06-18 16:01:29', 'note': '', 
+'order_num': 9, 'action_type': '', 'progress': '0/0', 'percent': '0%', 
+'plant_code': 'RAC1', 'description': '润安模拟月结', 'year': '2026', 
+'period': '06', 'cost_area': 'CRM', 'cost_version': '0', 'version_description': '核算版本', 
+
+'task_info': [{'company_code': 'RACQ', 'plant_code': ['RAC0', 'RAC1']}], 'company_code_list': [{'value': 'RACQ', 'description': '华润润安公司', 'label': 'RACQ 华润润安公司'}], 'plant_code_list': [{'value': 'RAC0', 'description': '华润润安无价值工厂', 'label': 'RAC0 华润润安无价值工厂'}, {'value': 'RAC1', 'description': '华润润安有价值工厂', 'label': 'RAC1 华润润安有价值工厂'}], 'label': '1780905368759 润安模拟月结', 'value': '1780905368759', 'company_code': 'RACQ', 'company_code_desc': '华润润安公司', 'task_code_desc': '润安模拟月结', 'condition': {'task_code': '1780905368759', 'description': '润安模拟月结', 'year': '2026', 'period': '06', 'cost_area': 'CRM', 'cost_area_description': '润安成本管理组织', 'cost_version': '0', 'version_description': '核算版本', 'status': '1', 'task_info': [{'company_code': 'RACQ', 'plant_code': ['RAC0', 'RAC1']}], 'company_code_list': [{'value': 'RACQ', 'description': '华润润安公司', 'label': 'RACQ 华润润安公司'}], 'plant_code_list': [{'value': 'RAC0', 'description': '华润润安无价值工厂', 'label': 'RAC0 华润润安无价值工厂'}, {'value': 'RAC1', 'description': '华润润安有价值工厂', 'label': 'RAC1 华润润安有价值工厂'}], 'label': '1780905368759 润安模拟月结', 'value': '1780905368759', 'company_code': 'RACQ', 'company_code_desc': '华润润安公司', 'plant_code': 'RAC0', 'task_code_desc': '润安模拟月结'}, 'type': 'query'}}
+
+
+@calc_time
+def Text_semiproduct_deduct_push():
+    """半成品扣料推送接口 测试
+    task_id 603
+    """
+    user_id = 'testuser'
+    payload = Text_semiproduct_deduct_push_payload.get("data") or {}
+    task_id = payload.get("task_id") or 603
+
+    # 公共参数校验, 失败直接返回
+    ok, msg, params = validate_wip_variance_params(payload)
+    # if not ok:
+    #     print(f"===半成品扣料推送接口=== 参数校验失败: {msg}")
+    #     return
+    res_bus = wip_variance_adjust_posting_core(
+        user_id, task_id, params["year"], params["period"], params["plant_code"]
+    )
+    print(f"===半成品扣料推送接口=== 处理结束!!! 返回: {res_bus}")
+    return res_bus
+
+
+if __name__ == "__main__":
+    Text_semiproduct_deduct_push()
+

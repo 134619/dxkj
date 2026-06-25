@@ -583,3 +583,62 @@ def _to_ymd(date_value):
         return text[:8]
     except Exception:
         return ""
+    
+
+
+
+Text_semiproduct_deduct_push_payload = {
+    "_payload_": {
+        "sort_info": [],
+        "filter_info": {},
+        "group_info": [],
+        "statistic_info": [],
+        "page": {
+            "page_size": 0,
+            "page_num": 1
+        },
+        "export_excel": "false"
+    },
+    "data": {
+        "year": "2025",
+        "period": "11",
+        "plant_code": "CC00",
+        "plant_code_desc": "长存POC演示工厂",
+        "task_code": "1763647327439",
+        "task_code_desc": "test",
+        "step": "01-00",
+        "plant_code_list": [
+            {
+                "value": "CC00",
+                "description": "德信科技-北京-有价值工厂",
+                "label": "CC00 德信科技-北京-有价值工厂"
+            }
+        ]
+    }
+}
+
+
+
+@calc_time
+def Text_semiproduct_deduct_push():
+    """半成品扣料推送接口 测试
+    task_id 603
+    """
+    print("===半成品扣料推送接口===")
+    user_id = 'testuser'
+    payload = Text_semiproduct_deduct_push_payload.get("data") or {}
+    task_id = payload.get("task_id") or 603
+
+    # 公共参数校验, 失败直接返回
+    ok, msg, params = validate_deduct_params(payload)
+    if not ok:
+        print(f"===半成品扣料推送接口=== 参数校验失败: {msg}")
+        return
+    res_bus = semiproduct_deduct_push_core(
+        user_id, task_id, params["year"], params["period"], params["plant_code"]
+    )
+    print(f"===半成品扣料推送接口=== 处理结束!!! 返回: {res_bus}")
+    return res_bus
+
+if __name__ == "__main__":
+    Text_semiproduct_deduct_push()
