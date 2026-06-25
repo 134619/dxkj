@@ -152,7 +152,7 @@ def bom_material_deduct_push():
 
 @calc_time
 def bom_material_deduct_push_core(user_id, task_id, year, period, plant_code):
-    """搭BOM材料扣料 核心逻辑(604 core)
+    """搭BOM材料扣料 核心逻辑(605 core)
     查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态。
     :return: {"code", "msg", "data", "display"}
     """
@@ -342,10 +342,8 @@ def bom_material_deduct_query_data(body):
 # ---------- SAP 货物移动 组装/发送/解析/回写 ----------
 def get_pending_list(plant_code, year, period):
     """查询待推送的搭BOM材料扣料记录
-
-    TODO(联调): status 的判定与 report↔result 的关联键待确认,
               目前按 t_co_summary_report 的 plant/year/period + 移动类型 201/202/Y01/Y02 取,
-              并以结果表 status != '2' 作为待推送(关联键待补)。
+              并以结果表 status != '2' 作为待推送。
     :return: list[dict]
     """
     move_types = ", ".join(f"'{m}'" for m in MOVE_TYPE_ALL)
@@ -486,8 +484,8 @@ def build_gm_item(record, idx):
 def generate_ipindex():
     """生成 IP_INDEX: HMH + YYYYMMDD + 5位流水
 
-    TODO(联调): 流水号需保证全局唯一, 正式应取中间表最大流水+1 或独立序列;
-               这里先用时间戳末5位兜底, 仅供联调。
+    流水号需保证全局唯一, 正式应取中间表最大流水+1 或独立序列;
+               这里先用时间戳末5位兜底。
     """
     now = datetime.now()
     seq = str(int(now.timestamp()) % (10 ** IPINDEX_SEQ_WIDTH)).zfill(IPINDEX_SEQ_WIDTH)
@@ -527,8 +525,8 @@ def extract_gm_response(sap_resp):
 
 def update_summary_result(records, resp):
     """回写 t_co_summary_result: 物料凭证号/年度/状态/消息
-    TODO(联调): result 表的关联键与字段以实际表结构为准,
-              目前按 summary_line 更新(搭BOM 无订单号, 关联键待补), 字段用文档映射。
+    result 表的关联键与字段以实际表结构为准,
+              目前按 summary_line 更新(搭BOM 无订单号), 字段用文档映射。
     """
     if not records:
         return

@@ -1,7 +1,7 @@
 # -*- coding: UTF-8 -*-
 """
 @File    : ZZ_wip_variance_adjust_posting.py
-@Author  : your.name@dxdstech.com
+@Author  : yang.zhang@dxdstech.com
 @Date    : 2026/06/16
 @explain : 在制差异调整过账
 

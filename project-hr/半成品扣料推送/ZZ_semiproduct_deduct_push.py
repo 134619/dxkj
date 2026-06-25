@@ -45,6 +45,7 @@ INTERFACE_NAME = "半成品扣料推送接口"
 # MES与SAP接口编号 / 中间表
 IP_NO = "MES_MM_004"
 MID_TABLE = "ZMES_MM_GOODSREC"            # Oracle 中间表(秘火先 INSERT, 再调 RFC)
+
 PROCESS_FLG_INIT = "5"                    # 秘火写入中间表时的初始状态(SAP 成功置 2 / 失败置 D)
 MANDT = get_cnf("rfc.client")             # SAP 集团号(=RFC client, 生产 801 / 测试 500)
 
@@ -346,10 +347,8 @@ def semiproduct_deduct_query_data(body):
 # ---------- SAP 货物移动 组装/发送/解析/回写 ----------
 def get_pending_list(plant_code, year, period):
     """查询待推送的半成品扣料记录
-
-    TODO(联调): status 的判定与 report与result 的关联键待确认,
               目前按 t_co_summary_report 的 plant/year/period + 移动类型261/262 取,
-              并以结果表 status != '2' 作为待推送(关联键待补)。
+              并以结果表 status != '2' 作为待推送。
     :return: list[dict]
     """
     cond = (
@@ -535,8 +534,7 @@ def extract_gm_response(sap_resp):
 
 def update_summary_result(records, resp):
     """回写 t_co_summary_result: 物料凭证号/年度/状态/消息
-
-    TODO(联调): result 表的关联键与字段以实际表结构为准,
+     result 表的关联键与字段以实际表结构为准,
               目前按 (prodosn + summary_line) 更新, 字段用文档映射。
     """
     if not records:

@@ -123,8 +123,7 @@ def standard_cost_update():
 
 
 def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_code=None):
-    """标准成本更新 核心逻辑
-
+    """标准成本更新 核心逻辑(606 core)
     ZBAPI_MATVAL_PRICE_CHANGE 单次只改一个物料价格, 故逐条调用、回写, 最后回查最新状态。
     :return: {"code", "msg", "data", "display"}
     """

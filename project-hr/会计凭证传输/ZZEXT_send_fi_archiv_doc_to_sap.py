@@ -135,39 +135,64 @@ def send_fi_archiv_doc():
         失败: {"type": "E", "message": "处理异常"}
         成功: {"type": "S", "message": "OK"}
     """
-    res = Response()
     req = Request()
-    user_id = '0'
+    user_id = req.header("user_id") or '0'
     body = json.loads(req.body())
     send_data = body.get("data", {})
     response = {}
-    summary_unique_number = send_data.get("summary_unique_number", "")
-    company_code = send_data.get("company_code", "")
-    year = send_data.get("year", "")
-    archiv_doc_num = send_data.get("archiv_doc_num", "")
+    print(f"===会计凭证过账推送接口(RFC)=== 处理开始 参数: {body}")
 
-    time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    operator_data = {
-        "create_id": user_id,
-        "create_time": time,
-        "update_id": user_id,
-        "update_time": time,
-    }
-    # 准备RFC请求数据 (查询/值转换逻辑与SAP一致, 仅组装字段不同)
-    rfc_send_data = prepare_rfc_request(summary_unique_number, company_code, year, archiv_doc_num)
-    # 发送RFC请求
-    rfc_resp_data = send_rfc_request(rfc_send_data)
-    # 检查返回是否为空
-    if not rfc_resp_data:
-        raise ItfBizError("RFC接口返回空数据")
-    # 解析RFC返回数据
-    type_txt, message_txt, resp_dto_data = extract_rfc_response_data(rfc_resp_data, rfc_send_data)
-    # 处理返回数据
-    resp_dto_data.update(operator_data)
-    resp_dto_data.update(rfc_send_data.get("extra_data", {}))
-    handle_sap_response(resp_dto_data)
-    # 处理成功
-    response = {"type": type_txt, "message": message_txt}
+    try:
+        summary_unique_number = send_data.get("summary_unique_number", "")  # 汇总唯一号
+        company_code = send_data.get("company_code", "")  # 公司代码
+        year = send_data.get("year", "")  # 年度
+        archiv_doc_num = send_data.get("archiv_doc_num", "")  # 会计凭证归档号
+
+        time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        operator_data = {
+            "create_id": user_id,
+            "create_time": time,
+            "update_id": user_id,
+            "update_time": time,
+        }
+        # 准备RFC请求数据 (查询/值转换逻辑与SAP一致, 仅组装字段不同)
+        rfc_send_data = prepare_rfc_request(summary_unique_number, company_code, year, archiv_doc_num)
+        if not rfc_send_data["is_pass"]:
+            rfc_send_data.pop("is_pass")
+            # 发送RFC请求
+            rfc_resp_data = send_rfc_request(rfc_send_data)
+            # 检查返回是否为空
+            if not rfc_resp_data:
+                raise ItfBizError("RFC接口返回空数据")
+            # 解析RFC返回数据
+            type_txt, message_txt, resp_dto_data = extract_rfc_response_data(rfc_resp_data, rfc_send_data)
+            # 处理返回数据
+            resp_dto_data.update(operator_data)
+            resp_dto_data.update(rfc_send_data.get("extra_data", {}))
+            handle_sap_response(resp_dto_data)
+            # 处理成功
+            response = {"type": type_txt, "message": message_txt}
+        else:
+            # 金额为0(无明细), 无需调用RFC, 直接落库为成功
+            resp_dto_data = {
+                "summary_unique_number": rfc_send_data["head"].get("IP_INDEX"),  # 汇总唯一号
+                "company_code": rfc_send_data["head"].get("COMP_CODE"),  # 公司代码
+                "fi_sum_doc_type": rfc_send_data["head"].get("DOC_TYPE"),  # 凭证类型
+                "archiv_doc_num": rfc_send_data["head"].get("REF_DOC_NO"),  # 参照
+                "external_sn": "",  # 会计凭证号
+                "posting_status": "S",  # 过账状态
+                "note": "金额为0, 无需过账",  # 状态信息
+            }
+            resp_dto_data.update(operator_data)
+            resp_dto_data.update(rfc_send_data.get("extra_data", {}))
+            handle_sap_response(resp_dto_data)
+            response = {"type": "S", "message": "金额为0, 无需过账"}
+    except ItfBizError as e:
+        response = {"type": "E", "message": str(e)}
+        traceback.print_exc()
+    except Exception as e:
+        response = {"type": "E", "message": str(e)}
+        traceback.print_exc()
     print(f"===会计凭证过账推送接口(RFC)=== 处理结束!!! 返回: {response}")
     return response
 
@@ -178,7 +203,6 @@ def send_fi_archiv_doc():
 def find_co_manufacturing_adjust():
     """
     根据筛选参数查询制造调整(WIP差额)数据
-    :param db: 数据库连接
     :param plant_code: 工厂代码
     :param year: 年度
     :param period: 期间
@@ -238,7 +262,6 @@ def find_co_manufacturing_adjust():
     WHERE 1 = 1 {cond}
     ORDER BY `id` ASC;
     """
-    # print(f"find_co_manufacturing_adjust sql: {sql}")
     data = db.query_sql(sql)
     if data:
         response = {"type": "S", "message": "查询成功", "data": data}
@@ -247,33 +270,10 @@ def find_co_manufacturing_adjust():
     return response
 
 
-    # 分页代码，暂时不使用分页，先注释掉
-    # query_sql = query_sql.replace("    ", " ")
-
-    # page_size = param.get("page", {}).get("page_size")
-    # page_num = param.get("page", {}).get("page_num")
-    # if use_limit_sql:
-    #     data_sum = get_total_count(query_sql)
-    #     limit_sql = generate_limit_sql(page_size, page_num)
-    #     last_query_sql = query_sql + limit_sql
-    #     query_data = db.query_sql(last_query_sql)
-    #     page_size = page_size if page_size else data_sum
-    #     if page_size:
-    #         total_pages = data_sum // page_size + (1 if data_sum % page_size > 0 else 0)
-    #     else:
-    #         total_pages = 0
-    # else:
-    #     query_data = db.query_sql(query_sql)
-    #     paginator = Paginator(query_data, page_size)
-    #     total_pages = paginator.total_pages
-    #     data_sum = len(query_data)
-
-
-
-
 @calc_time
 def prepare_rfc_request(summary_unique_number, company_code, year, archiv_doc_num):
     """
+    603 core 核心逻辑
     准备RFC请求数据 (头数据+明细数据), 查询与值转换逻辑与SAP一致
     :param summary_unique_number: 汇总唯一号
     :param company_code: 公司代码
