@@ -34,7 +34,7 @@ from ZZEXT_SapRFC import SAPRFC
 
 # ---------- 固定值(按接口需求) ----------
 P_RELEASE = "X"            # 需要解冻物料时, 传X
-VALUATION_VIEW = 0         # 评估视图, 固定传0(每种货币类型行都传0)
+VALUATION_VIEW = "0"       # 评估视图(NUMC类型), 两种货币类型行都固定传"0"(文档示例 0, 0)
 CURR_TYPES = ("10", "30")  # 10=公司代码货币, 30=集团公司记账货币; 需同时传两种
 
 # SAP接口编码 / RFC函数名
@@ -124,7 +124,8 @@ def standard_cost_update():
 
 def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_code=None):
     """标准成本更新 核心逻辑(606 core)
-    ZBAPI_MATVAL_PRICE_CHANGE 单次只改一个物料价格, 故逐条调用、回写, 最后回查最新状态。
+    一次性把所有待更新记录合并成一次 ZBAPI_MATVAL_PRICE_CHANGE 调用(全列式清单),
+    整批共用一个返回结果并逐条回写, 最后回查最新状态。
     :return: {"code", "msg", "data", "display"}
     """
     code, msg = 200, "无可更新记录"
@@ -136,45 +137,35 @@ def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_co
     records = get_standard_cost_update_list(plant_code, year, period, mat_code)
     print("待更新记录--", records)
 
-    resp_code_list = []
-    fail_msgs = []
-    for record in records:
-        mat = record.get("mat_code", "")
+    total = len(records)
+    if total:
+        # ===== 一次性全推送: 所有记录合并成一次 ZBAPI_MATVAL_PRICE_CHANGE 调用(全列式清单) =====
         try:
-            # 组装并发送(单物料)
-            sap_send_data = prepare_price_change_request(record)
+            sap_send_data = prepare_price_change_request(records)
             sap_resp = send_price_change_request(sap_send_data)
-            # 解析
+            # 解析(整批共用一个结果)
             resp = extract_price_change_response(sap_resp)
-            # 回写
-            update_standard_price(record, resp, user_id)
+            # 逐条回写 过账状态/价格更改凭证号/备注
+            for record in records:
+                update_standard_price(record, resp, user_id)
 
             if str(resp.get("p_ret")) == "2":
-                resp_code_list.append(200)
+                code, msg = 200, f"更新成功 {total} 条"
             else:
-                resp_code_list.append(206)
-                each_msg = f"{mat}: {resp.get('p_msg') or 'SAP返回失败'}"
-                fail_msgs.append(each_msg)
+                code = 206
+                msg = f"更新失败 {total} 条; {resp.get('p_msg') or 'SAP返回失败'}"
         except Exception as e:
             traceback.print_exc()
-            resp_code_list.append(206)
-            fail_msgs.append(f"{mat}: {e}")
-            # 异常时把该条置为失败
-            update_standard_price(record, {
+            code = 206
+            msg = f"更新异常 {total} 条; {e}"
+            # 异常时把整批置为失败
+            fail_resp = {
                 "ml_doc_num": "",
                 "p_msg": str(e),
                 "p_ret": "3",
-            }, user_id)
-
-    total = len(records)
-    if total and not fail_msgs:
-        code, msg = 200, f"更新成功 {total} 条"
-    elif fail_msgs:
-        code = 206
-        fail_cnt = sum(1 for c in resp_code_list if c != 200)
-        succ_cnt = len(resp_code_list) - fail_cnt
-        msg = (f"共 {total} 条, 成功 {succ_cnt} 条, 失败 {fail_cnt} 条; "
-               f"失败明细: {'; '.join(fail_msgs)}")
+            }
+            for record in records:
+                update_standard_price(record, fail_resp, user_id)
 
     # 回查最终状态(供前端刷新表格)
     data, display = standard_cost_update_query_data(body)
@@ -344,34 +335,60 @@ def get_standard_cost_update_list(plant_code, year, period, mat_code=None):
     return query_db_records_by_cond(db, TABLE_NAME, cond, cols)
 
 
-def prepare_price_change_request(record):
-    """组装 ZBAPI_MATVAL_PRICE_CHANGE 请求数据
-    价格明细表(PRICES)需同时传两种货币类型:
-      10=公司代码货币, 30=集团公司记账货币
+def prepare_price_change_request(records):
+    """组装 批量 ZBAPI_MATVAL_PRICE_CHANGE 请求数据(全列式清单)
+
+    一次性推送多条物料, 所有多值字段按列展平成 list:
+      - MATERIAL / VALUATIONAREA : 每条记录一个值(长度 N)
+      - PRICES 内字段            : 每条记录 × 两种货币类型(10/30)各一个值(长度 2N)
+      - P_RELEASE 全批共用, 保持标量
     秘火侧仅有本位币(basic_currency)与单位标准成本(standard_cost_bc),
     故两种货币类型行暂传相同的价格/货币(若集团币不同需在此扩展)。
-    :return: dict 顶层扁平结构 + PRICES 表(两行)
-    """
-    price = _parse_amount(record.get("standard_cost_bc"))
-    currency = record.get("basic_currency", "") or ""
-    price_unit = _parse_amount(record.get("price_unit")) or 1
 
-    price_change_rows = []
-    for curr_type in CURR_TYPES:
-        price_change_rows.append({
-            "VALUATION_VIEW": VALUATION_VIEW,        # 评估视图 固定0
-            "CURR_TYPE": curr_type,                  # 10/30
-            "PRICE": price,                          # 单位标准成本(本位币)
-            "CURRENCY": currency,                    # 货币码(本位币)
-            "CURRENCY_ISO": currency,                # ISO货币码(本位币即ISO)
-            "PRICE_UNIT": price_unit,                # 价格单位
-        })
+    :param records: 待更新记录列表
+    :return: 批量请求 dict
+    """
+    if not records:
+        return {}
+
+    materials = []
+    valuation_areas = []
+    prices_valuation_view = []
+    prices_curr_type = []
+    prices_price = []
+    prices_currency = []
+    prices_currency_iso = []
+    prices_price_unit = []
+
+    for record in records:
+        materials.append(record.get("mat_code", ""))           # 物料编码
+        valuation_areas.append(record.get("plant_code", ""))   # 估价范围=工厂代码
+
+        price = _parse_amount(record.get("standard_cost_bc"))
+        currency = record.get("basic_currency", "") or ""
+        price_unit = _parse_amount(record.get("price_unit")) or 1
+
+        # 每条记录两种货币类型(10/30)各展开一行
+        for curr_type in CURR_TYPES:
+            prices_valuation_view.append(VALUATION_VIEW)   # 评估视图 固定"0"
+            prices_curr_type.append(curr_type)             # 10/30
+            prices_price.append(price)                     # 单位标准成本(本位币)
+            prices_currency.append(currency)               # 货币码(本位币)
+            prices_currency_iso.append(currency)           # ISO货币码(本位币即ISO)
+            prices_price_unit.append(price_unit)           # 价格单位
 
     return {
-        "MATERIAL": record.get("mat_code", ""),         # 物料编码
-        "VALUATIONAREA": record.get("plant_code", ""),  # 估价范围=工厂代码
-        "P_RELEASE": P_RELEASE,                         # 需要解冻物料时传X
-        "PRICES": price_change_rows,                    # 价格明细表(两行, 10/30)
+        "MATERIAL": materials,             # 物料编码 list(长度 N)
+        "VALUATIONAREA": valuation_areas,  # 估价范围 list(长度 N)
+        "P_RELEASE": P_RELEASE,            # 需要解冻物料时传X(全批共用)
+        "PRICES": {                        # 价格明细 列式清单(长度 2N)
+            "VALUATION_VIEW": prices_valuation_view,
+            "CURR_TYPE": prices_curr_type,
+            "PRICE": prices_price,
+            "CURRENCY": prices_currency,
+            "CURRENCY_ISO": prices_currency_iso,
+            "PRICE_UNIT": prices_price_unit,
+        },
     }
 
 

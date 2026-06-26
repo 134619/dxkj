@@ -178,19 +178,27 @@ def wip_variance_adjust_posting_core(user_id, task_id, year, period, plant_code)
     records = get_wip_variance_adjust_list(plant_code, year, period)
     print("待过账记录--", records)
 
-    # 按 id 去重, 避免同一记录重复推送
-    push_dict = {}
-    unique_records = []
+    # 按 物料(prd_mat_code)+生产订单(prodosn) 去重: 同组只推送第一条到 SAP,
+    # 但 SAP 返回的过账状态需回写到同组全部记录(含重复条)。
+    seen_key = {}
+    unique_records = []          # 去重后用于推送的每组第一条
+    dup_groups = {}              # dedup_key -> [同组全部记录], 用于回写状态
     for record in records:
-        record_id = record.get("id")
-        if record_id and not push_dict.get(record_id):
-            push_dict[record_id] = record
+        if not record.get("id"):
+            continue
+        dedup_key = (record.get("prd_mat_code") or "", record.get("prodosn") or "")
+        dup_groups.setdefault(dedup_key, []).append(record)
+        if dedup_key not in seen_key:
+            seen_key[dedup_key] = record
             unique_records.append(record)
 
-    record_cnt = len(unique_records)
+    # 全部记录(含重复), 用于回写过账状态
+    all_records = [_r for _group in dup_groups.values() for _r in _group]
+    push_cnt = len(unique_records)
+    total_cnt = len(all_records)
 
-    # ===== 一次性全推送: 所有待过账记录合并成一张 MIRO 发票凭证, 一次 RFC 调用 =====
-    if record_cnt:
+    # ===== 一次性全推送: 去重后的记录合并成一张 MIRO 发票凭证, 一次 RFC 调用 =====
+    if push_cnt:
         try:
             sap_send_data = prepare_miro_batch_request(unique_records)
             # 调用SAPRFC, 推送到RFC接口
@@ -200,31 +208,30 @@ def wip_variance_adjust_posting_core(user_id, task_id, year, period, plant_code)
             p_ret = str(resp.get("p_ret"))
 
             # 整批共用一个发票号, 逐条回写发票号/年度/备注/过账状态
-            for record in unique_records:
+            # (同组重复记录一并回写, 过账状态保持一致)
+            for record in all_records:
                 update_manufacturing_adjust(record, resp)
-
             if p_ret == "2":
-                code, msg = 200, f"过账成功 {record_cnt} 条"
+                code, msg = 200, f"过账成功 {total_cnt} 条(推送 {push_cnt} 条)"
             else:
                 code = 206
                 p_msg = resp.get("p_msg") or "SAP返回失败"
-                msg = f"过账失败 {record_cnt} 条; {p_msg}"
+                msg = f"过账失败 {total_cnt} 条(推送 {push_cnt} 条); {p_msg}"
         except Exception as e:
             traceback.print_exc()
             code = 206
-            msg = f"过账异常 {record_cnt} 条; {e}"
-            # 异常时把整批置为失败
+            msg = f"过账异常 {total_cnt} 条(推送 {push_cnt} 条); {e}"
+            # 异常时把整批(含重复)置为失败
             fail_resp = {
                 "invoice_doc_number": "",
                 "fiscal_year": "",
                 "p_msg": str(e),
                 "p_ret": "3",
             }
-            for record in unique_records:
+            for record in all_records:
                 update_manufacturing_adjust(record, fail_resp)
     # 回查最终状态(供前端刷新表格)
     data, display = wip_variance_adjust_query_data(body)
-
     return {"code": code, "msg": msg, "data": data, "display": display}
 
 
@@ -249,7 +256,6 @@ def wip_variance_adjust_query():
     body = json.loads(req.body())
     print("body----", body)
 
-
     # 公共参数校验(plant_code/year/period), 失败直接返回
     ok, msg, params = validate_wip_variance_params(body.get("data") or {})
     if not ok:
@@ -258,9 +264,6 @@ def wip_variance_adjust_query():
         res.set_body(json.dumps(response))
         res.commit(True)
         return
-
-    # 用标准化参数回写 data, 保证查询条件与过账一致
-    # body["data"] = {**(body.get("data") or {}), **params}
 
     payload = body.get('_payload_', {})
     filter_info = payload.get('filter_info', {})
@@ -381,7 +384,6 @@ def wip_variance_adjust_query_data(body):
     full_query_sql = full_query_sql.replace('    ', ' ').strip()
     print(full_query_sql)
     query_data = db.query_sql(full_query_sql)
-
     display = [
         {"field": "summary_type", "description": "汇总类型"},
         {"field": "summary_unique_number", "description": "汇总唯一号"},
@@ -414,7 +416,6 @@ def wip_variance_adjust_query_data(body):
         {"field": "posting_status", "description": "过账状态"},
         {"field": "note", "description": "备注"},
     ]
-
     return query_data, display
 
 
@@ -432,7 +433,7 @@ def get_wip_variance_adjust_list(plant_code, year, period):
         f" ORDER BY `id` ASC"
     )
 
-    cols = "`id`,`summary_unique_number`,`summary_line`,`summary_date`,`prd_mat_code`,`plant_code`,`year`,`amount_diff`,`posting_status`,`comp_amount_diff`"
+    cols = "`id`,`summary_unique_number`,`summary_line`,`summary_date`,`prd_mat_code`,`prodosn`,`plant_code`,`year`,`amount_diff`,`posting_status`,`comp_amount_diff`"
     data = query_db_records_by_cond(db, "t_co_manufacturing_adjust", cond, cols)
     print("查询待过账的在制差异调整记录--",data)
     return data
@@ -684,4 +685,7 @@ def Text_semiproduct_deduct_push():
 
 if __name__ == "__main__":
     Text_semiproduct_deduct_push()
+
+
+
 
