@@ -134,7 +134,6 @@ def wip_variance_adjust_posting():
     body = json.loads(req.body())
     print("body---", body)
     user_id = req.header("user_id")
-
     payload = body.get("data") or {}
     task_id = payload.get("task_id") or 602
 

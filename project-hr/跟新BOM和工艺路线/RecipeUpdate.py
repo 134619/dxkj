@@ -7,6 +7,7 @@
 @explain : 通过选择的工艺条件去更新BOM和工艺路线
 """
 import json
+from datetime import datetime
 
 import pandas as pd
 from DbHelper import DbHelper
@@ -353,10 +354,95 @@ def updateData(type, plant_code, data, **kwargs):
         ret = updateBOMSetupA(plant_code, data, user_id)
         return ret
     elif type == "Routing":
+        # 按 recipe_code 在 t_eq_recipe_activity_header 命中多个 work_center 时, 先展开工序行
+        expand_routing_operation_by_work_center(plant_code, data, user_id)
         ret = updateRouting(plant_code, data, user_id)
         return ret
     else:
         return ResponseData(400, "该类型不支持更新", [])
+
+
+def expand_routing_operation_by_work_center(plant_code, data, user_id):
+    """按 recipe_code 在 t_eq_recipe_activity_header 查多条 work_center, 为每个 work_center
+    复制一条 t_rgt_routing_operation(原行不动; 复制行新生成 item_no/operation_number, 其余字段照抄原行)。
+
+    仅对 data 里选中的 routing_group 生效, 在 updateRouting 之前调用。
+    只有当某 recipe_code 在 header 命中 >=2 条(多个 work_center)时才展开, 每条 header 复制一行。
+    """
+    db = DbHelper()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    insert_list = []
+
+    op_cols = (
+        "`id`,`plant_code`,`routing_group`,`routing_group_serial_number`,`item_no`,`operation_number`,"
+        "`recipe_id`,`recipe_code`,`sub_recipe_id`,`work_center`,`equipment_id`,"
+        "`operation_qty`,`operation_unit`,`operation_description`,"
+        "`effective_start_date`,`effective_end_date`,`wbs_elements`,`profit_center`"
+    )
+
+    for group in data:
+        routing_group = group.get("routing_group")
+        serial = group.get("routing_group_serial_number")
+        if routing_group is None or serial is None:
+            continue
+
+        # 该 routegroup 的工序
+        ops = db.query_sql(
+            f"""SELECT {op_cols} FROM `t_rgt_routing_operation`
+                WHERE `plant_code`='{plant_code}'
+                  AND `routing_group`='{routing_group}'
+                  AND `routing_group_serial_number`='{serial}'
+                ORDER BY `item_no` ASC """
+        )
+        if not ops:
+            continue
+
+        # 当前最大序号(供复制行生成新 item_no/operation_number, 避免与原行冲突)
+        seq_sql = f"""SELECT COALESCE(MAX(`item_no`),0) AS `max_item_no`,
+                             COALESCE(MAX(`operation_number`),0) AS `max_op_no`
+                      FROM `t_rgt_routing_operation`
+                      WHERE `plant_code`='{plant_code}'
+                        AND `routing_group`='{routing_group}'
+                        AND `routing_group_serial_number`='{serial}' """
+        seq_ret = db.query_sql(seq_sql)
+        max_item_no = seq_ret[0].get("max_item_no") if seq_ret else 0
+        max_op_no = seq_ret[0].get("max_op_no") if seq_ret else 0
+
+        seq = 0
+        for op in ops:
+            recipe_code = op.get("recipe_code")
+            if not recipe_code:
+                continue
+            # 按 recipe_code 查 header(可能多条 work_center)
+            headers = db.query_sql(
+                f"""SELECT `work_center` FROM `t_eq_recipe_activity_header`
+                    WHERE `recipe_code`='{recipe_code}'
+                      AND `plant_code`='{plant_code}'
+                      AND `valid_state`='1' """
+            )
+            if len(headers) < 2:
+                # 仅在多条 work_center 时展开
+                continue
+            for h in headers:
+                seq += 1
+                new_op = {**op}
+                new_op.pop("id", None)
+                new_op["work_center"] = h.get("work_center")
+                new_op["item_no"] = max_item_no + seq
+                new_op["operation_number"] = max_op_no + seq
+                new_op["create_id"] = user_id
+                new_op["create_time"] = now
+                new_op["update_id"] = user_id
+                new_op["update_time"] = now
+                insert_list.append(new_op)
+
+    if insert_list:
+        db.batchInsertToDB("t_rgt_routing_operation", insert_list, printSql=True)
+        db.updateDBObj()
+        logger.printInfo("expand_routing_operation_by_work_center 新增工序行数", len(insert_list))
+
+
+
 
 
 @ResetResponse(params=["type", "plant_code", "routing_group", "routing_group_serial_number"],

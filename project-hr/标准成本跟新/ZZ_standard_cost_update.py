@@ -30,7 +30,8 @@ from ToolsMethods import (
     generate_raw_sql,
 )
 from utils import query_db_records_by_cond, update_db_record_by_cond
-from ZZEXT_SapRFC import SAPRFC
+
+# from ZZEXT_SapRFC import SAPRFC
 
 # ---------- 固定值(按接口需求) ----------
 P_RELEASE = "X"            # 需要解冻物料时, 传X
@@ -45,6 +46,87 @@ INTERFACE_NAME = "标准成本更新接口"
 TABLE_NAME = "t_sap_mmd_standard_price"
 
 db = DbHelper()
+
+
+
+import pyrfc
+from libenhance import get_cnf
+from logger import LoggerConfig
+
+usprint = LoggerConfig()
+
+
+class SAPRFC:
+    def __init__(self):
+        # 从配置文件获取SAP连接参数
+        ashost = get_cnf("rfc.ashost")
+        sysnr = get_cnf("rfc.sysnr")
+        client = get_cnf("rfc.client")
+        user = get_cnf("rfc.user")
+        passwd = get_cnf("rfc.passwd")
+        lang = get_cnf("rfc.lang")  # 默认中文
+        trace = get_cnf("rfc.trace")  # 默认不追踪
+
+        try:
+            self.connection = pyrfc.Connection(
+                ashost=ashost,
+                sysnr=sysnr,
+                client=client,
+                user=user,
+                passwd=passwd,
+                lang=lang,
+                trace=trace
+            )
+            usprint.printInfo('SAPRFC', f"SAP连接成功: {ashost}, 系统编号: {sysnr}")
+        except Exception as e:
+            raise Exception(f"SAP RFC连接异常: {e}")
+
+    def call(self, rfc_name, params=None):
+        """
+        调用RFC函数
+        :param rfc_name: RFC函数名称
+        :param params: 输入参数字典（可选）
+        :return: 返回结果字典
+        """
+        try:
+            if params:
+                result = self.connection.call(rfc_name, **params)
+            else:
+                result = self.connection.call(rfc_name)
+
+            usprint.printInfo('SAPRFC', f"调用 {rfc_name} 成功")
+            return result
+
+        except pyrfc.ABAPApplicationError as e:
+            usprint.printInfo('SAPRFC', f"ABAP应用错误 - {rfc_name}: {e}")
+            raise
+        except pyrfc.CommunicationError as e:
+            usprint.printInfo('SAPRFC', f"通信错误 - {rfc_name}: {e}")
+            raise
+        except pyrfc.LogonError as e:
+            usprint.printInfo('SAPRFC', f"登录错误 - {rfc_name}: {e}")
+            raise
+        except Exception as e:
+            usprint.printInfo('SAPRFC', f"调用 {rfc_name} 失败: {e}")
+            raise
+
+    def close(self):
+        """关闭SAP连接"""
+        try:
+            if self.connection:
+                self.connection.close()
+                usprint.printInfo('SAPRFC', "SAP连接已关闭")
+        except Exception as e:
+            usprint.printInfo('SAPRFC', f"关闭连接异常: {e}")
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+
 
 
 # ---------- 公共参数校验(posting / query 共用) ----------
@@ -124,8 +206,8 @@ def standard_cost_update():
 
 def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_code=None):
     """标准成本更新 核心逻辑(606 core)
-    一次性把所有待更新记录合并成一次 ZBAPI_MATVAL_PRICE_CHANGE 调用(全列式清单),
-    整批共用一个返回结果并逐条回写, 最后回查最新状态。
+    ZBAPI_MATVAL_PRICE_CHANGE 的 MATERIAL/VALUATIONAREA 均为标量参数, 单次只改一个物料,
+    故逐条调用、回写, 最后回查最新状态。
     :return: {"code", "msg", "data", "display"}
     """
     code, msg = 200, "无可更新记录"
@@ -137,18 +219,25 @@ def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_co
     records = get_standard_cost_update_list(plant_code, year, period, mat_code)
     print("待更新记录--", records)
 
+    # 暂不按 物料+工厂 分组
+    # # 按 物料+工厂 分组: 同一物料的多条价格记录合并到一次调用(MATERIAL 为标量, 单次一个物料)
+    # groups = {}
+    # for record in records:
+    #     key = (record.get("mat_code", ""), record.get("plant_code", ""))
+    #     groups.setdefault(key, []).append(record)
+
+    # 一次性推送: 所有记录合并到一次调用(PRICES 含全部价格行; MATERIAL/VALUATIONAREA 取首条, 需为同一物料)
     total = len(records)
     if total:
-        # ===== 一次性全推送: 所有记录合并成一次 ZBAPI_MATVAL_PRICE_CHANGE 调用(全列式清单) =====
         try:
             sap_send_data = prepare_price_change_request(records)
+            print("----------------", sap_send_data)
             sap_resp = send_price_change_request(sap_send_data)
-            # 解析(整批共用一个结果)
+            # 解析(整批共用一个返回结果)
             resp = extract_price_change_response(sap_resp)
-            # 逐条回写 过账状态/价格更改凭证号/备注
+            # 逐条回写
             for record in records:
                 update_standard_price(record, resp, user_id)
-
             if str(resp.get("p_ret")) == "2":
                 code, msg = 200, f"更新成功 {total} 条"
             else:
@@ -336,59 +425,40 @@ def get_standard_cost_update_list(plant_code, year, period, mat_code=None):
 
 
 def prepare_price_change_request(records):
-    """组装 批量 ZBAPI_MATVAL_PRICE_CHANGE 请求数据(全列式清单)
+    """组装 ZBAPI_MATVAL_PRICE_CHANGE 请求数据(单物料, 多价格行)
 
-    一次性推送多条物料, 所有多值字段按列展平成 list:
-      - MATERIAL / VALUATIONAREA : 每条记录一个值(长度 N)
-      - PRICES 内字段            : 每条记录 × 两种货币类型(10/30)各一个值(长度 2N)
-      - P_RELEASE 全批共用, 保持标量
+    MATERIAL/VALUATIONAREA 为标量参数(单次一个物料), records 须为同一物料(同 mat_code+plant_code)。
+    PRICES 为价格行 list, 每条记录展开两行(货币类型 10=公司代码货币 / 30=集团记账货币),
+    每行字段为标量: VALUATION_VIEW / CURR_TYPE / PRICE / CURRENCY / PRICE_UNIT。
     秘火侧仅有本位币(basic_currency)与单位标准成本(standard_cost_bc),
-    故两种货币类型行暂传相同的价格/货币(若集团币不同需在此扩展)。
+    故两种货币类型暂传相同的价格/货币(若集团币不同需在此扩展)。
 
-    :param records: 待更新记录列表
-    :return: 批量请求 dict
+    :param records: 同一物料的价格记录列表
+    :return: dict 顶层标量字段 + PRICES 表(list, 每记录两行 10/30)
     """
     if not records:
         return {}
 
-    materials = []
-    valuation_areas = []
-    prices_valuation_view = []
-    prices_curr_type = []
-    prices_price = []
-    prices_currency = []
-    prices_currency_iso = []
-    prices_price_unit = []
-
+    first = records[0]
+    prices = []
     for record in records:
-        materials.append(record.get("mat_code", ""))           # 物料编码
-        valuation_areas.append(record.get("plant_code", ""))   # 估价范围=工厂代码
-
         price = _parse_amount(record.get("standard_cost_bc"))
         currency = record.get("basic_currency", "") or ""
         price_unit = _parse_amount(record.get("price_unit")) or 1
-
-        # 每条记录两种货币类型(10/30)各展开一行
-        for curr_type in CURR_TYPES:
-            prices_valuation_view.append(VALUATION_VIEW)   # 评估视图 固定"0"
-            prices_curr_type.append(curr_type)             # 10/30
-            prices_price.append(price)                     # 单位标准成本(本位币)
-            prices_currency.append(currency)               # 货币码(本位币)
-            prices_currency_iso.append(currency)           # ISO货币码(本位币即ISO)
-            prices_price_unit.append(price_unit)           # 价格单位
+        for curr_type in CURR_TYPES:  # ("10", "30")
+            prices.append({
+                "VALUATION_VIEW": "0",        # 评估视图(NUMC), 固定"0"
+                "CURR_TYPE": curr_type,       # 10=公司代码货币, 30=集团记账货币
+                "PRICE": price,               # 单位标准成本(本位币)
+                "CURRENCY": currency,         # 货币码(本位币)
+                "PRICE_UNIT": price_unit,     # 价格单位
+            })
 
     return {
-        "MATERIAL": materials,             # 物料编码 list(长度 N)
-        "VALUATIONAREA": valuation_areas,  # 估价范围 list(长度 N)
-        "P_RELEASE": P_RELEASE,            # 需要解冻物料时传X(全批共用)
-        "PRICES": {                        # 价格明细 列式清单(长度 2N)
-            "VALUATION_VIEW": prices_valuation_view,
-            "CURR_TYPE": prices_curr_type,
-            "PRICE": prices_price,
-            "CURRENCY": prices_currency,
-            "CURRENCY_ISO": prices_currency_iso,
-            "PRICE_UNIT": prices_price_unit,
-        },
+        "MATERIAL": first.get("mat_code", ""),         # 物料编码(标量)
+        "VALUATIONAREA": first.get("plant_code", ""),  # 估价范围=工厂代码(标量)
+        "P_RELEASE": P_RELEASE,                        # 需要解冻物料时传X
+        "PRICES": prices,                              # 价格明细表(每记录两行 10/30)
     }
 
 
@@ -429,7 +499,6 @@ def extract_price_change_response(sap_resp):
 
 def update_standard_price(record, resp, user_id):
     """回写 t_sap_mmd_standard_price: 价格更改凭证号/备注/过账状态
-
     posting_status: P_RET '2'->'S'(成功), 其余->'E'(失败), 与表既有约定一致
     注: ML_DOC_YEAR 仅记录不入库, 避免覆盖作为查询键的期间年度(year)
     """
@@ -462,10 +531,6 @@ def _parse_amount(value):
         return 0.0
 
 
-
-
-
-
 Text_semiproduct_deduct_push_payload = {'data': {'id': 24, 'task_code': '1780905368759', 
 'step': '09-00', 'task_id': 602, 'up_task_id': 0, 
 'step_name': '在制差异调整过账', 'status': '1', 'excute_user': '', 
@@ -474,15 +539,12 @@ Text_semiproduct_deduct_push_payload = {'data': {'id': 24, 'task_code': '1780905
 'order_num': 9, 'action_type': '', 'progress': '0/0', 'percent': '0%', 
 'plant_code': 'RAC1', 'description': '润安模拟月结', 'year': '2026', 
 'period': '06', 'cost_area': 'CRM', 'cost_version': '0', 'version_description': '核算版本', 
-
 'task_info': [{'company_code': 'RACQ', 'plant_code': ['RAC0', 'RAC1']}], 'company_code_list': [{'value': 'RACQ', 'description': '华润润安公司', 'label': 'RACQ 华润润安公司'}], 'plant_code_list': [{'value': 'RAC0', 'description': '华润润安无价值工厂', 'label': 'RAC0 华润润安无价值工厂'}, {'value': 'RAC1', 'description': '华润润安有价值工厂', 'label': 'RAC1 华润润安有价值工厂'}], 'label': '1780905368759 润安模拟月结', 'value': '1780905368759', 'company_code': 'RACQ', 'company_code_desc': '华润润安公司', 'task_code_desc': '润安模拟月结', 'condition': {'task_code': '1780905368759', 'description': '润安模拟月结', 'year': '2026', 'period': '06', 'cost_area': 'CRM', 'cost_area_description': '润安成本管理组织', 'cost_version': '0', 'version_description': '核算版本', 'status': '1', 'task_info': [{'company_code': 'RACQ', 'plant_code': ['RAC0', 'RAC1']}], 'company_code_list': [{'value': 'RACQ', 'description': '华润润安公司', 'label': 'RACQ 华润润安公司'}], 'plant_code_list': [{'value': 'RAC0', 'description': '华润润安无价值工厂', 'label': 'RAC0 华润润安无价值工厂'}, {'value': 'RAC1', 'description': '华润润安有价值工厂', 'label': 'RAC1 华润润安有价值工厂'}], 'label': '1780905368759 润安模拟月结', 'value': '1780905368759', 'company_code': 'RACQ', 'company_code_desc': '华润润安公司', 'plant_code': 'RAC0', 'task_code_desc': '润安模拟月结'}, 'type': 'query'}}
 
 
 def Text_standard_cost_update():
     """标准成本更新接口 按钮 测试"""
     user_id = "test_user"
-
-
 
     payload = Text_semiproduct_deduct_push_payload.get("data") or {}
     task_id = payload.get("task_id")  # 仅日志关联用, 缺省为 None
@@ -496,7 +558,7 @@ def Text_standard_cost_update():
         user_id, task_id, params["year"], params["period"], params["plant_code"], params.get("mat_code")
     )
     print(f"===标准成本更新接口=== 处理结束!!! 返回: {res_bus}")
-
+    return
 
 if __name__ == "__main__":
 

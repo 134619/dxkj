@@ -5,34 +5,39 @@
 @Date    : 2026/1/10 15:03
 @explain : 会计凭证过账推送接口
 
-  调用方向:   秘火->SAP/Oracle
+  调用方向:   秘火->SAP
   模块名称:   会计引擎
   接口名称:   会计凭证过账推送接口
-  接口说明：  会计过账凭证, 汇总凭证传输过账
+  接口说明：  会计过账凭证, 汇总凭证传输过账, 调 SAP RFC(ZRFC_MH_DOC_POST_MASS),
+             按 公司代码+年度+期间 查待过账凭证, 逐条推送并回写结果至
+             t_fi_doc_for_archiv_transfer_log / t_fi_doc_for_archiv_head。
 
-  入口 send_fi_archiv_doc(payload, user_id, task_id, plant_code, special_sign):
-    按 t_interface_configuration.push_system 派发到 Oracle / SAP(中间件) / RFC 三条通道,
-    并把发票号/过账状态/备注回写至 t_fi_doc_for_archiv_transfer_log。
-    返回 {"type": "S"/"E", "message": "..."}。
-    被 ZZEXT_MonthBillStepPushSAP 月结调度以 4 个位置参数调用, 签名/返回不可随意改动。
+  收发方式参照 ZZ_standard_cost_update.py / ZZ_semiproduct_deduct_push.py:
+    入口 Request().body() 取参, Response.set_body/commit 返回;
+    返回体 {code, msg, data, display}, 查询支持 _payload_ 过滤/排序/分页/导出。
 """
+import json
 import traceback
 from datetime import datetime
 from functools import lru_cache
 
 from DbHelper import DbHelper
-from OracleDB import OracleDB
-from ToolsMethods import calc_time
-from utils import ItfBizError, update_db_record_by_cond
+from libenhance import Request, Response
+from ToolsMethods import (
+    GetExportData,
+    Paginator,
+    calc_time,
+    create_table_alias,
+    display_to_entozh,
+    generate_raw_sql,
+)
+from utils import ItfBizError, query_db_records_by_cond, update_db_record_by_cond
 from ZZEXT_SapRFC import SAPRFC
-from ZZEXT_SendRequest import SendToSap
 
 # ---------- 固定值(按接口需求, 集中维护) ----------
-# SAP(中间件) 接口编码 / 名称
-SAP_INTERFACE_CODE = "ACC_DOCUMENT_POST"
-SAP_INTERFACE_NAME = "会计凭证过账推送接口"
 # RFC 函数模块
 RFC_INTERFACE_CODE = "ZRFC_MH_DOC_POST_MASS"
+INTERFACE_NAME = "会计凭证过账推送接口"
 # 会计凭证类型默认 EA(成本中心相关的去掉)
 DOC_TYPE = "EA"
 accounting_document_type = "EA"
@@ -42,716 +47,369 @@ ARCHIV_HEAD_TABLE = "t_fi_doc_for_archiv_head"
 ARCHIV_DETAIL_TABLE = "t_fi_doc_for_archiv_details"
 TRANSFER_LOG_TABLE = "t_fi_doc_for_archiv_transfer_log"
 
+# 抬头查询列(推送组装 + 查询展示 共用)
+HEAD_COLUMNS = '''`id`,
+                `fi_ledger`,
+                `company_code`,
+                `accounting_document_type`,
+                `fi_sum_doc_type`,
+                `archiv_doc_num`,
+                `document_date`,
+                `posting_date`,
+                `year`,
+                `period`,
+                `summary_unique_number`,
+                `transaction_currency`,
+                `basic_currency`,
+                `exchange_rate`,
+                `header_text`,
+                `sum_dr_amount_bc`,
+                `sum_cr_amount_bc`,
+                `posting_status`,
+                `verify_status`,
+                `document_category`,
+                `associated_doc_type`,
+                `attachment_qty`,
+                `posting_person`,
+                `reference1_head`,
+                `reference2_head`,
+                `note`,
+                `update_time`'''
+
 # 模块级缓存 / 数据库
-archive_creator_info = {}
-interface_config_cache = {}
 company_cost_element_info = {}
 
 db = DbHelper()
-UUID = ""
 
 
-# ==================== 入口: 多分支派发 ====================
+# ---------- 公共参数校验(posting / query 共用) ----------
+def validate_fi_archiv_doc_params(data):
+    """校验会计凭证过账接口的公共参数(company_code / year / period)
+
+    与其他接口一致: 必填 company_code/year/period; year 4 位数字; period 1-12 补零。
+
+    :param data: 请求里的 data 字典(即 body["data"])
+    :return: (is_valid, message, params)
+        params 成功时含 {"company_code","year","period"}; 失败为 {}
+    """
+    if not isinstance(data, dict) or not data:
+        return False, "请求数据(data)为空或格式错误", {}
+
+    company_code = data.get("company_code")
+    year = data.get("year")
+    period = data.get("period")
+
+    company_code = company_code.strip() if isinstance(company_code, str) else company_code
+    year = str(year).strip() if year is not None else ""
+    period = str(period).strip() if period is not None else ""
+
+    missing = []
+    if not company_code:
+        missing.append("company_code(公司代码)")
+    if not year:
+        missing.append("year(年度)")
+    if not period:
+        missing.append("period(期间)")
+    if missing:
+        return False, f"缺少必填参数: {'、'.join(missing)}", {}
+
+    if not (year.isdigit() and len(year) == 4):
+        return False, f"年度(year)应为4位数字, 当前: {year!r}", {}
+    if not period.isdigit():
+        return False, f"期间(period)必须为数字, 当前: {period!r}", {}
+    period_num = int(period)
+    if period_num < 1 or period_num > 12:
+        return False, f"期间(period)必须在1-12之间, 当前: {period}", {}
+    period = f"{period_num:02d}"
+
+    params = {"company_code": str(company_code), "year": year, "period": period}
+    return True, "校验通过", params
+
+
+# ==================== 推送入口 ====================
 @calc_time
-def send_fi_archiv_doc(payload, user_id=0, task_id=None, plant_code=None, special_sign=False):
-    """会计凭证过账推送接口 入口
-
-    按 t_interface_configuration.push_system 派发:
-      Oracle -> send_fi_archiv_doc_to_oracle
-      RFC    -> send_fi_archiv_doc_to_rfc   (ZRFC_MH_DOC_POST_MASS)
-      SAP    -> send_fi_archiv_doc_to_sap   (中间件 ACC_DOCUMENT_POST, 含未知 push_system 的默认)
-    无 plant_code/task_id 时默认走 SAP。
-
-    :param payload: 请求参数(字典, 兼容 {"data": {...}} 或直接 {...})
-    :param user_id: 操作人ID
-    :param task_id: 对应月结步骤
-    :param plant_code: 工厂代码
-    :param special_sign: 特殊标记(透传给 SAP/RFC 通道)
-    :return: {"type": "S"/"E", "message": "..."}
+def send_fi_archiv_doc():
+    """会计凭证过账推送接口 按钮(无参 HTTP 入口)
+    按 company_code + year + period 查待过账凭证, 逐条调 RFC 过账并回写。
     """
-    # 兼容 payload.data 存在与否
-    payload_data = payload.get("data") if isinstance(payload, dict) else None
-    send_data = payload_data if payload_data else payload
-    company_code = send_data.get("company_code", "")
+    print("===会计凭证过账推送接口===")
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
+    print("body---", body)
+    user_id = req.header("user_id")
 
-    print(f"===会计凭证过账推送接口=== 处理开始 参数: {payload}")
-    if plant_code and task_id:
-        interface_configuration_data = get_interface_configuration(company_code, plant_code, task_id)
-        if interface_configuration_data:
-            push_system = interface_configuration_data.get("push_system")
-            if push_system == "Oracle":
-                print("===会计凭证过账推送接口=== 推送Oracle系统...")
-                response = _push_to_oracle(send_data)
-            elif push_system == "RFC":
-                print("===会计凭证过账推送接口=== 推送RFC系统...")
-                response = send_fi_archiv_doc_to_rfc(send_data, user_id=user_id, special_sign=special_sign)
-            else:  # SAP 及其它情况默认走 SAP(中间件)
-                print("===会计凭证过账推送接口=== 推送SAP系统...")
-                response = send_fi_archiv_doc_to_sap(send_data, user_id=user_id, special_sign=special_sign)
-        else:
-            response = {"type": "E", "message": "未查询到需要推送的系统"}
+    payload = body.get("data") or {}
+    task_id = payload.get("task_id")  # 仅日志关联用, 缺省为 None
+
+    # 公共参数校验, 失败直接返回
+    ok, msg, params = validate_fi_archiv_doc_params(payload)
+    if not ok:
+        response = {"code": 500, "type": "E", "msg": msg}
+        print(f"===会计凭证过账推送接口=== 参数校验失败: {msg}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
+        return
+
+    # 校验通过, 调推送 core
+    res_bus = send_fi_archiv_doc_core(user_id, task_id, params["company_code"], params["year"], params["period"])
+    print(f"===会计凭证过账推送接口=== 处理结束!!! 返回: {res_bus}")
+    res.set_body(json.dumps(res_bus))
+    res.commit(True)
+
+
+@calc_time
+def send_fi_archiv_doc_core(user_id, task_id, company_code, year, period):
+    """会计凭证过账 核心逻辑
+
+    按 公司代码+年度+期间 查待过账(posting_status != 'S')的汇总凭证抬头,
+    所有凭证合并到一次 SAP RFC(ZRFC_MH_DOC_POST_MASS)调用过账, 整批共用一个返回结果,
+    逐条回写, 最后回查最新状态返回(供前端刷新)。
+
+    :return: {"code", "msg", "data", "display"}
+    """
+    code, msg = 200, "无可过账记录"
+    body = {"data": {"company_code": company_code, "year": year, "period": period}}
+    print(f"===会计凭证过账 core=== user_id={user_id} task_id={task_id} "
+          f"company_code={company_code} {year}-{period}")
+
+    # 查询待过账抬头(posting_status != 'S')
+    heads = get_pending_archiv_head_list(company_code, year, period)
+    print("待过账抬头--", heads)
+
+    total = len(heads)
+    if total:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        operator_data = {"create_id": user_id, "create_time": now, "update_id": user_id, "update_time": now}
+        try:
+            # 一次性推送: 所有凭证合并到一次 RFC 调用
+            DATA, doc_meta_list, zero_meta_list = prepare_rfc_batch_request(heads)
+
+            # 无明细(金额为0)的凭证无需过账, 直接落库成功
+            for meta in zero_meta_list:
+                handle_sap_response({**meta, **operator_data,
+                                     "external_sn": "", "posting_status": "S", "note": "金额为0, 无需过账"})
+
+            if DATA.get("TABLE"):
+                rfc_resp = send_rfc_request(DATA)
+                if not rfc_resp:
+                    raise ItfBizError("RFC接口返回空数据")
+                type_txt, message_txt, external_sn = extract_rfc_batch_response(rfc_resp)
+                # 整批共用一个返回结果, 逐条回写
+                for meta in doc_meta_list:
+                    handle_sap_response({**meta, **operator_data,
+                                         "external_sn": external_sn, "posting_status": type_txt, "note": message_txt})
+                if type_txt == "S":
+                    code, msg = 200, f"过账成功 {total} 条"
+                else:
+                    code = 206
+                    msg = f"过账失败 {total} 条; {message_txt}"
+            else:
+                code, msg = 200, f"过账成功 {total} 条" + ("(金额为0, 无需过账)" if zero_meta_list else "")
+        except Exception as e:
+            traceback.print_exc()
+            code = 206
+            msg = f"过账异常 {total} 条; {e}"
+            # 异常时把进入 TABLE 的凭证置为失败
+            for meta in doc_meta_list:
+                handle_sap_response({**meta, **operator_data,
+                                     "external_sn": "", "posting_status": "E", "note": str(e)})
+
+    # 回查最终状态(供前端刷新表格)
+    data, display = send_fi_archiv_doc_query_data(body)
+    return {"code": code, "msg": msg, "data": data, "display": display}
+
+
+# ==================== 查询接口 ====================
+@calc_time
+def send_fi_archiv_doc_query():
+    """会计凭证过账查询接口
+    支持 _payload_ 里的 filter_info / sort_info / page / export_excel
+    """
+    print("===会计凭证过账查询接口===")
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
+    print("body----", body)
+
+    # 公共参数校验(company_code/year/period), 失败直接返回
+    ok, msg, _ = validate_fi_archiv_doc_params(body.get("data") or {})
+    if not ok:
+        response = {"code": 500, "type": "E", "msg": msg}
+        print(f"===会计凭证过账查询接口=== 参数校验失败: {msg}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
+        return
+
+    payload = body.get("_payload_", {})
+    filter_info = payload.get("filter_info", {})
+    sort_info = payload.get("sort_info", {})
+    export_excel = payload.get("export_excel")
+
+    query_data, display = send_fi_archiv_doc_query_data(body)
+    if export_excel:
+        stamp_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+        excel_filename = f"会计凭证过账-{stamp_suffix}.xlsx"
+        format_data = [{"sheet1": query_data}]
+        field_dict = display_to_entozh(display)
+        GetExportData(format_data, excel_filename, field_dict)
     else:
-        print("===会计凭证过账推送接口=== 推送SAP系统...")
-        response = send_fi_archiv_doc_to_sap(send_data, user_id=user_id, special_sign=special_sign)
+        page_size = payload.get("page", {}).get("page_size", 0)
+        page_num = payload.get("page", {}).get("page_num", 1)
+        paginator = Paginator(query_data, page_size)
+        page_items = paginator.get_page(page_num)
+        total_pages = paginator.total_pages
+        data_sum = len(query_data)
 
-    print(f"===会计凭证过账推送接口=== 处理结束!!! 返回: {response}")
-    return response
-
-
-def _push_to_oracle(send_data):
-    """Oracle 通道包装: 调 send_fi_archiv_doc_to_oracle 并回写 transfer_log"""
-    company_code = send_data.get("company_code", "")
-    year = send_data.get("year", "")
-    archiv_doc_num = send_data.get("archiv_doc_num", "")
-    try:
-        summary_unique_number, TYPE, MESSAGE, external_sn, company_code, posting_status = send_fi_archiv_doc_to_oracle(
-            company_code, year, archiv_doc_num)
-        resp_dto_data = {
-            "summary_unique_number": summary_unique_number,  # 汇总唯一号
-            "archiv_doc_num": archiv_doc_num,                # 归档凭证号
-            "company_code": company_code,                    # 公司代码
-            "external_sn": ",".join(external_sn),            # EBS凭证号
-            "posting_status": posting_status,                # 过账状态
-            "year": year,                                    # 年度
+        response = {
+            "code": 200,
+            "msg": "成功",
+            "data": page_items,
+            "page": {
+                "page_size": page_size if page_size else len(query_data),
+                "page_num": page_num,
+                "page_sum": total_pages,
+                "data_sum": data_sum,
+            },
+            "rule": {"sort_info": sort_info, "filter_info": filter_info},
+            "display": display,
         }
-        handle_sap_response(resp_dto_data)
-        response = {"type": TYPE, "message": MESSAGE}
-    except ItfBizError as e:
-        response = {"type": "E", "message": str(e)}
-    except Exception as e:
-        traceback.print_exc()
-        response = {"type": "E", "message": str(e)}
-    return response
+        print(f"===会计凭证过账查询接口=== 处理结束!!! 返回: {response}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
 
 
-# ==================== Oracle 通道 ====================
-def send_fi_archiv_doc_to_oracle(company_code: str, year: str, archiv_doc_num: str):
+def send_fi_archiv_doc_query_data(body):
+    """会计凭证过账 查询核心逻辑(查询接口/导出/过账回查复用)
+    :return: (query_data, display)
     """
-    :param company_code   公司代码
-    :param year           年度
-    :param archiv_doc_num 归档凭证编号
-    :return: (summary_unique_number, TYPE, MESSAGE, external_sn, company_code, posting_status)
-        TYPE           消息类型(成功S/失败E)
-        MESSAGE        消息文本
-        external_sn    EBS凭证号列表
-        posting_status 过账状态
-    """
-    db = DbHelper()
-    exp_columns = '''
-                    'NEW' AS STATUS,
-                    t1.summary_unique_number as REFERENCE1,
-                    t2.summary_unique_number as REFERENCE6,
-                    t1.company_code as SEGMENT1,
-                    t1.posting_date as ACCOUNTING_DATE,
-                    t1.posting_status,
-                    t1.transaction_currency as CURRENCY_CODE,
-                    NOW() as DATE_CREATED,
-                    1090 as CREATED_BY,
-                    'A' as ACTUAL_FLAG,
-                    'CDGM_记帐凭证' as USER_JE_CATEGORY_NAME,
-                    'MHGL' as USER_JE_SOURCE_NAME,
-                    CASE
-                        WHEN t1.exchange_rate=1.0 THEN NULL
-                        ELSE t1.exchange_rate
-                    END AS CURRENCY_CONVERSION_RATE,
-                    t1.archiv_doc_num as REFERENCE5,
-                    t1.header_text as REFERENCE2,
-                    t2.accounting_subjects as SEGMENT3,
+    data_filter = body.get("data") or {}
+    payload = body.get("_payload_", {})
+    filter_info = payload.get("filter_info", {})
+    sort_info = payload.get("sort_info", {})
 
-                    CASE
-                        WHEN t2.debit_credit_mark='Dr' THEN t2.amount_tc
-                        ELSE NULL
-                    END AS ENTERED_DR,
+    # 前置筛选(任务级固定条件): 公司/年度/期间/过账状态/归档凭证号
+    prefix_filter = {}
+    for field in ("company_code", "year", "period", "posting_status", "archiv_doc_num"):
+        val = data_filter.get(field)
+        if val not in (None, ""):
+            prefix_filter[field] = val
 
-                    CASE
-                        WHEN t2.debit_credit_mark='Cr' THEN t2.amount_tc
-                        ELSE NULL
-                    END AS ENTERED_CR,
-
-                    CASE
-                        WHEN t2.debit_credit_mark='Dr' THEN t2.amount_bc
-                        ELSE NULL
-                    END AS ACCOUNTED_DR,
-
-                    CASE
-                        WHEN t2.debit_credit_mark='Cr' THEN t2.amount_bc
-                        ELSE NULL
-                    END AS ACCOUNTED_CR,
-
-                    IFNULL( t2.cost_center, ' ' ) AS SEGMENT2,
-                    t2.prod_order AS REFERENCE21,
-                    t2.item_text AS REFERENCE10,
-                    IFNULL( t2.wbs_elements, ' ' ) AS SEGMENT6,
-                    IFNULL( t2.reserved1, ' ' ) AS SEGMENT7,
-                    IFNULL( t2.reserved2, ' ' ) AS SEGMENT4,
-                    IFNULL( t2.reserved3, ' ' ) AS SEGMENT5,
-                    IFNULL( t2.reserved4, ' ' ) AS SEGMENT8,
-                    DATE_FORMAT(t1.posting_date, '%Y-%m') AS PERIOD_NAME
- '''
-
-    columns = exp_columns.strip()
-    query_sql = '''
-                SELECT {}
-                FROM
-                    t_fi_doc_for_archiv_head as t1
-                LEFT JOIN t_fi_doc_for_archiv_details AS t2
-                ON t1.archiv_doc_num = t2.archiv_doc_num
-                and t1.company_code = t2.company_code
-                and t1.year = t2.year
-                and t1.summary_unique_number = t2.summary_unique_number
-
-                where 1=1
-                '''.format(columns)
-
-    summary_unique_number = ''
-    external_sn = []
-    posting_status = ''
-    if company_code:
-        query_sql += " and t1.company_code = {}".format(repr(company_code))
-    if year:
-        query_sql += " and t1.year = {}".format(repr(year))
-    if archiv_doc_num:
-        query_sql += " and t1.archiv_doc_num = {}".format(repr(archiv_doc_num))
-
-    summaryCertificateData = db.query_sql(query_sql)
-    print(summaryCertificateData)
-
-    # OracleDB 连接
-    Oracledb = OracleDB()
-
-    if summaryCertificateData:
-
-        summary_unique_number = summaryCertificateData[0].get('REFERENCE1', '')
-
-        external_sn = []
-        posting_status = summaryCertificateData[0].get('posting_status', '')
-        # 插入ebs 数据库表 gl_interface
-
-        col_ls = ['STATUS', 'REFERENCE1', 'REFERENCE6', 'SEGMENT1', 'ACCOUNTING_DATE', 'CURRENCY_CODE', 'DATE_CREATED',
-                  'CREATED_BY',
-                  'ACTUAL_FLAG', 'USER_JE_CATEGORY_NAME', 'USER_JE_SOURCE_NAME',
-                  'CURRENCY_CONVERSION_RATE', 'REFERENCE5', 'REFERENCE2',
-                  'SEGMENT3', 'ENTERED_DR',
-                  'ENTERED_CR', 'ACCOUNTED_DR', 'ACCOUNTED_CR', 'SEGMENT2', 'REFERENCE21', 'REFERENCE10',
-                  'SEGMENT6', 'SEGMENT7', 'SEGMENT4', 'SEGMENT5', 'SEGMENT8', 'PERIOD_NAME']
-
-        insert_sql = """
-        insert all
+    query_sql = f"""
+            SELECT
+                {HEAD_COLUMNS}
+            FROM
+                `{ARCHIV_HEAD_TABLE}`
+            WHERE 1 = 1
         """
 
-        for item in summaryCertificateData:
-            item.pop('posting_status')
-            for i, j in item.items():
-
-                if i in ['ENTERED_DR', 'ENTERED_CR', 'ACCOUNTED_DR', 'ACCOUNTED_CR']:
-                    item[i] = float(j)
-                elif i in ['ACCOUNTING_DATE', 'DATE_CREATED']:
-                    item[i] = f"TO_DATE('{j}', 'SYYYY-MM-DD HH24:MI:SS')"
-                elif i == 'CURRENCY_CONVERSION_RATE' and j == 0.0:
-                    item[i] = 'NUll'
-                elif i in ['SEGMENT4', 'SEGMENT5', 'SEGMENT6', 'SEGMENT7', 'SEGMENT8'] and j == '':
-
-                    item[i] = repr('0')
-                else:
-                    item[i] = repr(j)
-
-            insert_sql += " into gl_interface ( {} ) values( {} )  ".format(','.join(col_ls), ','.join(item.values()))
-
-        delete_sql = """
-                DELETE
-                FROM gl_interface
-                WHERE  REFERENCE5 = {} AND SEGMENT1 = {} AND TO_CHAR(TO_DATE(PERIOD_NAME, 'YYYY-MM'), 'YYYY') = {} AND STATUS = 'NEW'
-                """.format(repr(archiv_doc_num), repr(company_code), repr(year))
-
-        print(delete_sql)
-        Oracledb.execute(delete_sql)
-
-        insert_sql += " select 1 from dual"
-        print(insert_sql)
-        row_count = Oracledb.execute(insert_sql)
-        if row_count > 0:
-            procedure_name = """
-            cux_mh_if_pkg.submit_gl_request
-            """
-            out_params = {
-                "x_return_status": str,  # 输出参数：返回状态
-                "x_msg_count": int,      # 输出参数：消息数量
-                "x_msg_data": str        # 输出参数：消息内容
-            }
-            status, count, msg_data = toEBS(Oracledb, procedure_name, out_params=out_params)
-            print(status)
-            print(count)
-            print(msg_data)
-
-            if status and status == 'S':
-                # 调用成功，成功存储
-                TYPE = status
-                MESSAGE = '存储过程调用成功,凭证生成成功'
-                external_sn = msg_data.replace('..', '').split('PZNUM:')
-                external_sn.remove('')
-            elif status and status == 'E':
-                # 调用成功，存储失败
-                TYPE = status
-                MESSAGE = '存储过程调用成功,凭证生成失败'
-                STATUS_sql = """
-                select STATUS_DESCRIPTION
-                from gl_interface
-                WHERE  REFERENCE5 = {} AND SEGMENT1 = {} AND TO_CHAR(TO_DATE(PERIOD_NAME, 'YYYY-MM'), 'YYYY') = {} AND STATUS_DESCRIPTION IS NOT NULL
-                """.format(repr(archiv_doc_num), repr(company_code), repr(year))
-
-                STATUS_DESCRIPTION_data = Oracledb.query(STATUS_sql)
-
-                if STATUS_DESCRIPTION_data:
-                    MESSAGE += ':'
-                    for i, j in enumerate(STATUS_DESCRIPTION_data):
-                        MESSAGE += "{}.{}".format(i + 1, j.get('STATUS_DESCRIPTION'))
-            else:
-                # 调用失败
-                TYPE = "S"
-                MESSAGE = '存储过程调用失败'
-
-            return summary_unique_number, TYPE, MESSAGE, external_sn, company_code, posting_status
-        else:
-            TYPE = 'E'
-            MESSAGE = '未查询到相关凭证数据'
-            return summary_unique_number, TYPE, MESSAGE, external_sn, company_code, posting_status
+    table_alias = create_table_alias(HEAD_COLUMNS)
+    where_sql, sort_sql = generate_raw_sql(prefix_filter, filter_info, sort_info, table_alias)
+    if not sort_sql:
+        sort_sql = " ORDER BY `id` DESC"
+    if where_sql:
+        where_sql = where_sql.replace("WHERE ", " AND ")
+        full_query_sql = query_sql + where_sql + sort_sql
     else:
-        TYPE = 'E'
-        MESSAGE = '未查询到相关凭证数据'
-        return summary_unique_number, TYPE, MESSAGE, external_sn, company_code, posting_status
+        full_query_sql = query_sql + sort_sql
+
+    full_query_sql = full_query_sql.replace("    ", " ").strip()
+    print(full_query_sql)
+    query_data = db.query_sql(full_query_sql)
+
+    display = [
+        {"field": "company_code", "description": "公司代码"},
+        {"field": "fi_ledger", "description": "财务核算分类账"},
+        {"field": "accounting_document_type", "description": "会计凭证类型"},
+        {"field": "fi_sum_doc_type", "description": "归档汇总类型"},
+        {"field": "archiv_doc_num", "description": "归档汇总凭证号"},
+        {"field": "document_date", "description": "凭证日期"},
+        {"field": "posting_date", "description": "过账日期"},
+        {"field": "year", "description": "年度"},
+        {"field": "period", "description": "期间"},
+        {"field": "summary_unique_number", "description": "汇总号"},
+        {"field": "transaction_currency", "description": "交易货币"},
+        {"field": "basic_currency", "description": "本位币"},
+        {"field": "exchange_rate", "description": "汇率"},
+        {"field": "header_text", "description": "抬头文本"},
+        {"field": "sum_dr_amount_bc", "description": "汇总借方金额_本位币"},
+        {"field": "sum_cr_amount_bc", "description": "汇总贷方金额_本位币"},
+        {"field": "posting_status", "description": "过账状态"},
+        {"field": "verify_status", "description": "校验状态"},
+        {"field": "document_category", "description": "单据类别"},
+        {"field": "associated_doc_type", "description": "业务凭证类型"},
+        {"field": "attachment_qty", "description": "附件数"},
+        {"field": "posting_person", "description": "过账人"},
+        {"field": "reference1_head", "description": "参考信息1"},
+        {"field": "reference2_head", "description": "参考信息2"},
+        {"field": "note", "description": "备注"},
+        {"field": "update_time", "description": "更新时间"},
+    ]
+
+    return query_data, display
 
 
-def toEBS(Oracledb, procedure_name, in_params=None, out_params=None):
-    """调用 EBS 存储过程并取回输出参数"""
-    result = Oracledb.call_procedure(procedure_name, in_params=in_params, out_params=out_params)
-    print(result)
-    if result:
-        return result["x_return_status"], result["x_msg_count"], result["x_msg_data"]
-    return None, None, None
+# ==================== RFC 通道(批量) ====================
+def prepare_rfc_batch_request(heads):
+    """组装 批量 RFC 请求数据: 所有待过账凭证合并到一次调用(ZRFC_MH_DOC_POST_MASS)
 
+    每条凭证的明细行都带上本凭证抬头字段(IP_INDEX=summary_unique_number 作为凭证唯一标识,
+    供 SAP 在一个 TABLE 里区分多凭证), 全部并入一个 TABLE, 共用一个 BUKRS(company_code)。
+    无明细(金额为0)的凭证不进 TABLE, 由调用方直接落库成功。
 
-# ==================== SAP(中间件 ACC_DOCUMENT_POST) 通道 ====================
-@calc_time
-def send_fi_archiv_doc_to_sap(payload, user_id=0, special_sign=False):
-    """SAP(中间件) 通道: 组装 -> 发送 -> 解析 -> 回写
-    :param payload: 请求参数(字典, 兼容 {"data": {...}} 或直接 {...})
-    :return: {"type": "S"/"E", "message": "..."}
+    :param heads: 待过账抬头列表
+    :return: (DATA, doc_meta_list, zero_meta_list)
+        DATA            = {"BUKRS": company_code, "TABLE": [有明细凭证的所有行]}
+        doc_meta_list   = 进入 TABLE 的凭证回写元信息
+        zero_meta_list  = 无明细(金额为0)的凭证回写元信息
     """
-    response = {}
+    if not heads:
+        return {"BUKRS": "", "TABLE": []}, [], []
 
-    # 兼容 payload.data 存在与否
-    payload_data = payload.get("data") if isinstance(payload, dict) else None
-    send_data = payload_data if payload_data else payload
-    print(f"===会计凭证过账推送接口(SAP)=== 处理开始... 参数: {payload}")
+    company_code = heads[0].get("company_code", "")
+    table_rows = []
+    doc_meta_list = []    # 有明细, 进入 TABLE
+    zero_meta_list = []   # 无明细(金额为0), 不进 TABLE
 
-    try:
-        summary_unique_number = send_data.get("summary_unique_number", "")   # 汇总唯一号
-        company_code = send_data.get("company_code", "")                     # 公司代码
-        year = send_data.get("year", "")                                     # 年度
-        archiv_doc_num = send_data.get("archiv_doc_num", "")                 # 归档凭证号
+    for head in heads:
+        summary_unique_number = head.get("summary_unique_number", "")
+        head_company_code = head.get("company_code", "") or company_code
+        head_year = head.get("year", "")
 
-        time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        operator_data = {
-            "create_id": user_id,
-            "create_time": time,
-            "update_id": user_id,
-            "update_time": time,
+        meta = {
+            "summary_unique_number": summary_unique_number,
+            "company_code": head_company_code,
+            "year": head_year,
+            "archiv_doc_num": head.get("archiv_doc_num", ""),
+            "fi_sum_doc_type": head.get("fi_sum_doc_type", ""),
         }
-        # 准备SAP请求数据
-        sap_send_data = prepare_sap_request(summary_unique_number, company_code, year, archiv_doc_num, special_sign)
 
-        if not sap_send_data["is_pass"]:
-            sap_send_data.pop("is_pass")
-            # 发送SAP请求
-            sap_resp_data = send_sap_request(sap_send_data)
-            # 检查sap_resp_data是否为空
-            if not sap_resp_data:
-                raise ItfBizError("SAP接口返回空数据")
+        detail_list = find_fi_doc_for_archiv_details(summary_unique_number, head_company_code, head_year)
+        if not detail_list:
+            zero_meta_list.append(meta)
+            continue
 
-            # 解析SAP返回数据
-            type_txt, message_txt, resp_dto_data = extract_sap_response_data(sap_resp_data, sap_send_data)
-            # 处理SAP返回数据
-            resp_dto_data.update(operator_data)
-            resp_dto_data.update(sap_send_data.get("extra_data", {}))
-            handle_sap_response(resp_dto_data)
-            # 处理成功
-            response = {"type": type_txt, "message": message_txt}
-        else:
-            resp_dto_data = {
-                "summary_unique_number": sap_send_data["head"].get("ZOAID"),    # 凭证编号
-                "company_code": sap_send_data["head"].get("BUKRS"),             # 公司代码
-                "fi_sum_doc_type": sap_send_data["head"].get("BLART"),          # 凭证类型
-                "archiv_doc_num": sap_send_data["head"].get("XBLNR"),           # 参照
-                "external_sn": "",                                              # 凭证编号
-                "posting_status": "S",                                          # 过账状态
-                "note": "金额为0, 无需过账",                                    # 状态信息
-            }
-            resp_dto_data.update(operator_data)
-            resp_dto_data.update(sap_send_data.get("extra_data", {}))
-            handle_sap_response(resp_dto_data)
-            response = {"type": "S", "message": "金额为0, 无需过账"}
+        # 字段转换(按 t_fi_post_erp_value_transfer 配置)
+        for i in get_fi_post_erp_value_transfer_data():
+            if head.get(i["field_name"]) == i["before_value"]:
+                head[i["field_name"]] = i["after_value"]
+            for j in detail_list:
+                if j.get(i["field_name"]) == i["before_value"]:
+                    j[i["field_name"]] = i["after_value"]
 
-    except ItfBizError as e:
-        response = {"type": "E", "message": str(e)}
-        traceback.print_exc()
-    except Exception as e:
-        response = {"type": "E", "message": str(e)}
-        traceback.print_exc()
-    print(f"===会计凭证过账推送接口(SAP)=== 处理结束!!! 返回: {response}")
-    return response
+        cost_element_dict = get_company_cost_element_info(head_company_code)
+        rfc_head = build_rfc_send_data_head(head)
+        rfc_items = build_rfc_send_data_items(detail_list, cost_element_dict)
+        # 每条明细行带上本凭证抬头(含 IP_INDEX 凭证标识)
+        for item in rfc_items:
+            table_rows.append({**rfc_head, **item})
 
+        doc_meta_list.append(meta)
 
-def send_fi_archiv_doc_to_sap_for_api(payload, user_id):
-    """用于通过 postman 调用接口调试(脚本调用使用: send_fi_archiv_doc)
-    :param payload: {"guid": "...", "data": [{summary_unique_number, company_code, year, archiv_doc_num}]}
-    :return: {"guid", "type": "S/E", "message": "..."}
-    """
-    data = payload["data"]
-    if not data or not isinstance(data, list) or len(data) == 0:
-        return {"type": "E", "message": "请求数据为空"}
-
-    send_data = data[0]
-    if not send_data or not isinstance(send_data, dict):
-        return {"type": "E", "message": "请求数据格式错误"}
-
-    response = send_fi_archiv_doc_to_sap(send_data, user_id)
-    response["guid"] = payload.get("guid", "")
-    return response
-
-
-def send_fi_archive_doc_data_to_sap(send_data, user_id=0):
-    """直接以已查好的 抬头/明细/成本要素 推送 SAP(中间件)
-    :param send_data: {"archive_doc_head_data": {}, "archive_doc_detail_list": [], "cost_element_info": {}}
-    :return: {"type", "message", "data"}
-    """
-    print(f"===会计凭证过账推送接口(SAP)=== 处理开始... 参数: {send_data}")
-
-    try:
-        archive_doc_head_data = send_data.get("archive_doc_head_data", {})
-        archive_doc_detail_list = send_data.get("archive_doc_detail_list", [])
-        cost_element_info = send_data.get("cost_element_info", {})
-        time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        operator_data = {
-            "create_id": user_id,
-            "create_time": time,
-            "update_id": user_id,
-            "update_time": time,
-        }
-        # 准备SAP请求数据
-        sap_send_data = construct_sap_request(archive_doc_head_data, archive_doc_detail_list, cost_element_info)
-
-        # 发送SAP请求
-        sap_resp_data = send_sap_request(sap_send_data)
-        # 解析SAP返回数据
-        type_txt, message_txt, resp_dto_data = extract_sap_response_data(sap_resp_data, sap_send_data)
-        # 处理SAP返回数据
-        resp_dto_data.update(operator_data)
-        handle_sap_response(resp_dto_data)
-        # 处理成功
-        response = {"type": type_txt, "message": message_txt, "data": resp_dto_data}
-
-    except ItfBizError as e:
-        response = {"type": "E", "message": str(e), "data": {}}
-    except Exception as e:
-        traceback.print_exc()
-        response = {"type": "E", "message": str(e), "data": {}}
-    print(f"===会计凭证过账推送接口(SAP)=== 处理结束!!! 返回: {response}")
-    return response
-
-
-def construct_sap_request(archive_doc_head_data, archive_doc_detail_list, cost_element_info):
-    """由已查好的 抬头/明细 组装 SAP(中间件) 请求数据"""
-    sap_send_data_head = build_sap_send_data_head(archive_doc_head_data)
-    sap_send_data_items = build_sap_send_data_items(archive_doc_detail_list, cost_element_info)
-    return {"head": sap_send_data_head, "items": sap_send_data_items}
-
-
-@calc_time
-def prepare_sap_request(summary_unique_number, company_code, year, archiv_doc_num, special_sign):
-    """准备 SAP(中间件) 请求数据(头+明细), 数据加载/值转换与 RFC 通道共用 _load_archiv_doc_data
-    :return: {"head", "items", "extra_data", "is_pass"}
-    """
-    archiv_doc_head_data, archiv_doc_detail_list, cost_element_dict, is_pass = _load_archiv_doc_data(
-        summary_unique_number, company_code, year, archiv_doc_num)
-
-    sap_send_data_head = build_sap_send_data_head(archiv_doc_head_data)
-    sap_send_data_items = build_sap_send_data_items(archiv_doc_detail_list, cost_element_dict)
-
-    extra_data = {
-        "archiv_doc_head_id": archiv_doc_head_data.get("id"),
-        "accounting_document_type": accounting_document_type,
-        "year": year,
-    }
-    return {"head": sap_send_data_head, "items": sap_send_data_items, "extra_data": extra_data, "is_pass": is_pass}
-
-
-@calc_time
-def send_sap_request(sap_send_data):
-    """发送 SAP(中间件) 请求(ACC_DOCUMENT_POST)"""
-    global UUID
-
-    UUID = sap_send_data["head"].pop("ZOAID")
-    sap_send_data["head"]["ZOAID"] = ""
-    sap_req_param = {
-        "UUID": UUID,
-        "INPUT": {
-            "HEAD": sap_send_data.get("head"),
-            "ITEMS": sap_send_data.get("items"),
-        },
-    }
-    print(f"===SAP请求数据===: {sap_req_param}")
-    sap_resp_data = SendToSap(SAP_INTERFACE_CODE, SAP_INTERFACE_NAME, sap_req_param)
-    print(f"===SAP请求返回结果===: {sap_resp_data}")
-    return sap_resp_data
-
-
-def extract_sap_response_data(sap_resp_data, sap_send_data):
-    """解析 SAP(中间件) 返回数据
-    :return: (type_txt, message_txt, resp_dto_data)
-    """
-    sap_data = sap_resp_data.get("DATA") or {}
-    sap_resp_items = sap_data.get("ITEMS") or []
-
-    po_log_id = UUID
-    type_txt = sap_resp_data.get("TYPE", "E")
-    sap_message_txt = "凭证创建成功" if type_txt == "S" else sap_resp_data.get("MSG", "SAP接口调用失败")
-    if type_txt != "S":
-        type_txt = "E"
-    message_txt = sap_message_txt
-
-    external_sns = []
-    for item in sap_resp_items:
-        external_sn = item.get("BELNR", "")
-        if external_sn:
-            external_sns.append(external_sn)
-
-    resp_dto_data = {
-        "PO_LOG_ID": po_log_id,
-        "summary_unique_number": UUID,                                                       # 凭证编号
-        "company_code": sap_data.get("BUKRS"),                                               # 公司代码
-        "fi_sum_doc_type": sap_data.get("BLART") or sap_send_data["head"].get("BLART", ""),  # 凭证类型
-        "archiv_doc_num": sap_data.get("XBLNR") or sap_send_data["head"].get("XBLNR", ""),   # 参照
-        "external_sn": ",".join(external_sns),                                               # 凭证编号
-        "posting_status": type_txt,                                                          # 过账状态
-        "note": message_txt,                                                                 # 错误信息
-    }
-    return type_txt, message_txt, resp_dto_data
-
-
-def build_sap_send_data_head(archiv_doc_head_data):
-    """组装 SAP(中间件) 请求 head 数据"""
-    fi_sum_doc_type = archiv_doc_head_data.get('fi_sum_doc_type', '')
-    default_archive_creator_info = get_archive_creator(fi_sum_doc_type)
-    if not default_archive_creator_info:
-        raise ItfBizError("未取到自动归档凭证默认创建人")
-
-    head = {
-        "ZOAID": archiv_doc_head_data.get("summary_unique_number"),  # [CHAR|100] [必填] 唯一ID
-        "BUKRS": archiv_doc_head_data.get("company_code"),           # [CHAR|  4] [必填] 公司代码
-        "GJAHR": archiv_doc_head_data.get("year"),                   # [CHAR|  4] [必填] 会计年度
-        "BLART": archiv_doc_head_data.get("fi_sum_doc_type", ''),    # [CHAR|  2] [必填] 凭证类型
-        "BLDAT": archiv_doc_head_data.get("document_date"),          # [DATS|  8] [必填] 凭证日期
-        "BUDAT": archiv_doc_head_data.get("posting_date"),           # [DATS|  8] [必填] 过账日期
-        "WAERS": archiv_doc_head_data.get("transaction_currency"),   # [CHAR|  5] [必填] 币种
-        "KURSF": archiv_doc_head_data.get("exchange_rate"),          # [DEC|  9] 汇率
-        "XBLNR": archiv_doc_head_data.get("archiv_doc_num"),         # [CHAR| 16] 参照
-        "BKTXT": archiv_doc_head_data.get("year") + archiv_doc_head_data.get("period") + archiv_doc_head_data.get(
-            "header_text"),                                          # [CHAR| 25] 凭证抬头文本
-        "MONAT": archiv_doc_head_data.get("period"),                 # 期间
-        "USNAM": default_archive_creator_info["archiv_creater"],     # 创建人
-        "accounting_document_type": accounting_document_type,
-        "fi_sum_doc_type": archiv_doc_head_data.get("fi_sum_doc_type", ''),
-    }
-    return head
-
-
-def build_sap_send_data_items(archiv_doc_detail_list, cost_element_dict):
-    """组装 SAP(中间件) 请求 item 数据"""
-    items = []
-    for item in archiv_doc_detail_list:
-        amount_tc = float(item.get("dc_amount_tc", 0))  # 凭证货币金额
-        amount_bc = float(item.get("dc_amount_bc", 0))  # 本币金额
-
-        val_UMSKZ = ""   # 特别总账标识
-        val_XNEGP = ""   # 反记账标识, 金额>0空值; 金额<0传X
-        val_RSTGR = ""   # 原因代码
-        val_FWBAS = 0    # 基本金额(税基额), 空则传0
-        val_ZUONR = item.get("mat_doc_sn") + " " + item.get("mat_doc_items") if item.get(
-            "fi_sum_doc_type") == "Z9" else ""  # 分配
-        val_MWSKZ = ""   # 税码
-        val_VALUT = ""   # 起息日
-        val_ZLSCH = ""   # 付款方式
-        val_XREF3 = ""   # 参考代码3
-        val_HBKID = ""   # 开户银行
-        val_HKTID = ""   # 银行账户标识
-
-        KOSTL = item.get("cost_center", "")
-        AUFNR = item.get("prodosn", "") or item.get("cost_business_object1", "")
-        PROJK = item.get("wbs_elements", "")
-
-        item = {
-            "ZOAITEM": item.get("summary_line"),  # [CHAR|100] [必填] 唯一ID
-            "UMSKZ": val_UMSKZ,                   # [CHAR|  1] [必填] 特别总账标识
-            "HKONT": item.get("accounting_subjects", ""),  # [CHAR| 10] [必填] 科目编码
-            "KUNNR": item.get("customer_code", ""),        # [CHAR| 10] [必填] 客户编号
-            "LIFNR": item.get("vendor_code", ""),          # [CHAR| 10] [必填] 供应商或债权人的帐号
-            "ANLN1": item.get("asset_code1", ""),          # [CHAR| 12] [必填] 主资产号
-            "ANLN2": item.get("asset_code2", ""),          # [CHAR|  4] [必填] 资产次级编号
-            "ANBWA": item.get("asset_business_type", ""),  # [CHAR|  3] 资产业务类型
-            "XNEGP": val_XNEGP,                            # [CHAR|  1] [必填] 反记账标识
-            "RSTGR": val_RSTGR,                            # [CHAR|  3] [必填] 原因代码
-            "WRBTR": str(round(amount_tc, 2)),             # [CURR| 23] [必填] 凭证货币金额
-            "DMBTR": str(round(amount_bc, 2)),             # [CURR| 23] 本币金额
-            "FWBAS": val_FWBAS,                            # [CURR| 13] [必填] 基本金额(税基额)
-            "KOSTL": KOSTL if cost_element_dict.get(item.get("accounting_subjects", "")) else "",
-            # [CHAR| 10] [必填] 成本中心编码
-            "PRCTR": item.get("profit_center", ""),        # [CHAR| 10] [必填] 利润中心编码
-            "AUFNR": AUFNR if cost_element_dict.get(item.get("accounting_subjects", "")) else "",
-            # [CHAR| 10] [必填] 内部订单
-            "SGTXT": item.get("item_text", ""),            # [CHAR| 50] [必填] 行项目文本
-            "ZUONR": val_ZUONR,                            # [CHAR| 18] 分配
-            "MWSKZ": val_MWSKZ,                            # [CHAR|  2] [必填] 税码
-            "MATNR": item.get("mat_code", ""),             # [CHAR| 40] [必填] 物料号
-            "VBUND": item.get("trade_partner_code", ""),   # [CHAR|  6] [必填] 贸易伙伴
-            "PROJK": PROJK if cost_element_dict.get(item.get("accounting_subjects", "")) else "",
-            # [CHAR| 24] WBS元素
-            "VALUT": val_VALUT,                            # [DATS|  8] [必填] 起息日
-            "ZTERM": item.get("payment_terms", ""),        # [CHAR|  4] [必填] 付款条件
-            "ZFBDT": item.get("baseline_date", ""),        # [DATS|  8] [必填] 付款起算日
-            "ZLSCH": val_ZLSCH,                            # [CHAR|  4] [必填] 付款方式
-            "XREF1": "CB",                                 # [CHAR| 12] [必填] 固定值 CB
-            "XREF2": "",                                   # [CHAR| 12] 参考代码2
-            "XREF3": val_XREF3,                            # [CHAR| 20] 参考代码3
-            "HBKID": val_HBKID,                            # [CHAR|  5] [必填] 开户银行
-            "HKTID": val_HKTID,                            # [CHAR|  5] [必填] 银行账户标识
-            "MENGE": item.get("basic_uom", 0),             # [QUAN| 13] [必填] 数量
-            "MEINS": "" if not item.get("basic_qty", "") else item.get("basic_qty", ""),
-            # [UNIT|  3] [必填] 单位
-            "KNDNR": item.get("customer_code", ""),        # 获利能力段-客户编号
-            "KDAUF": "",                                   # 获利能力段-销售订单
-            "KDPOS": "",                                   # 获利能力段销售订单行
-            "XMWST": "",
-            "NETDT": "",
-            "WBS_ELEMENT": item.get("wbs_elements", "") if cost_element_dict.get(
-                item.get("accounting_subjects", "")) else "",
-            "EBELN": "",
-            "EBELP": "",
-            "VBELN": item.get("so_sn", ""),
-            "POSNR": item.get("so_items", ""),
-            "KOART": "S",
-            "FIPOS": "",
-            "FISTL": "",
-            "ZHTH": "",
-            "ZHTHH": "",
-            "ZFKJDH": "",
-            "ZFKJDMC": "",
-            "ZOAID_ORIGIN": "",
-            "ZOAITEM_ORIGIN": "",
-            "ZZFIELD01": "",
-            "ZZFIELD02": "",
-            "ZZFIELD03": "",
-            "ZZFIELD04": "",
-            "ZZFIELD05": "",
-            "ZZFIELD06": "",
-            "ZZFIELD07": "",
-            "ZZFIELD08": "",
-            "ZZFIELD09": "",
-            "ZZFIELD10": "",
-            "ZZFIELD11": "",
-            "ZZFIELD12": "",
-            "ZZFIELD13": "",
-            "ZZFIELD14": item.get("mat_code", ""),
-            "ZZFIELD15": "",
-            "ZZFIELD16": "",
-            "ZZFIELD17": "",
-            "ZZFIELD18": "",
-        }
-        items.append(item)
-    return items
-
-
-# ==================== RFC(ZRFC_MH_DOC_POST_MASS) 通道 ====================
-@calc_time
-def send_fi_archiv_doc_to_rfc(send_data, user_id=0, special_sign=False):
-    """RFC 通道: 组装 -> 发送(ZRFC_MH_DOC_POST_MASS) -> 解析 -> 回写
-    :param send_data: {summary_unique_number, company_code, year, archiv_doc_num}
-    :return: {"type": "S"/"E", "message": "..."}
-    """
-    response = {}
-    print(f"===会计凭证过账推送接口(RFC)=== 处理开始 参数: {send_data}")
-
-    try:
-        summary_unique_number = send_data.get("summary_unique_number", "")   # 汇总唯一号
-        company_code = send_data.get("company_code", "")                     # 公司代码
-        year = send_data.get("year", "")                                     # 年度
-        archiv_doc_num = send_data.get("archiv_doc_num", "")                 # 归档凭证号
-
-        time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        operator_data = {
-            "create_id": user_id,
-            "create_time": time,
-            "update_id": user_id,
-            "update_time": time,
-        }
-        # 准备RFC请求数据 (查询/值转换逻辑与SAP一致, 仅组装字段不同)
-        rfc_send_data = prepare_rfc_request(summary_unique_number, company_code, year, archiv_doc_num)
-        if not rfc_send_data["is_pass"]:
-            rfc_send_data.pop("is_pass")
-            # 发送RFC请求
-            rfc_resp_data = send_rfc_request(rfc_send_data)
-            # 检查返回是否为空
-            if not rfc_resp_data:
-                raise ItfBizError("RFC接口返回空数据")
-            # 解析RFC返回数据
-            type_txt, message_txt, resp_dto_data = extract_rfc_response_data(rfc_resp_data, rfc_send_data)
-            # 处理返回数据
-            resp_dto_data.update(operator_data)
-            resp_dto_data.update(rfc_send_data.get("extra_data", {}))
-            handle_sap_response(resp_dto_data)
-            # 处理成功
-            response = {"type": type_txt, "message": message_txt}
-        else:
-            # 金额为0(无明细), 无需调用RFC, 直接落库为成功
-            resp_dto_data = {
-                "summary_unique_number": rfc_send_data["head"].get("IP_INDEX"),  # 汇总唯一号
-                "company_code": rfc_send_data["head"].get("COMP_CODE"),          # 公司代码
-                "fi_sum_doc_type": rfc_send_data["head"].get("DOC_TYPE"),        # 凭证类型
-                "archiv_doc_num": rfc_send_data["head"].get("REF_DOC_NO"),       # 参照
-                "external_sn": "",                                               # 会计凭证号
-                "posting_status": "S",                                           # 过账状态
-                "note": "金额为0, 无需过账",                                     # 状态信息
-            }
-            resp_dto_data.update(operator_data)
-            resp_dto_data.update(rfc_send_data.get("extra_data", {}))
-            handle_sap_response(resp_dto_data)
-            response = {"type": "S", "message": "金额为0, 无需过账"}
-    except ItfBizError as e:
-        response = {"type": "E", "message": str(e)}
-        traceback.print_exc()
-    except Exception as e:
-        response = {"type": "E", "message": str(e)}
-        traceback.print_exc()
-    print(f"===会计凭证过账推送接口(RFC)=== 处理结束!!! 返回: {response}")
-    return response
-
-
-@calc_time
-def prepare_rfc_request(summary_unique_number, company_code, year, archiv_doc_num):
-    """准备 RFC 请求数据(头+明细), 数据加载/值转换与 SAP 通道共用 _load_archiv_doc_data
-    :return: {"head", "items", "extra_data", "is_pass"}
-    """
-    archiv_doc_head_data, archiv_doc_detail_list, cost_element_dict, is_pass = _load_archiv_doc_data(
-        summary_unique_number, company_code, year, archiv_doc_num)
-
-    rfc_send_data_head = build_rfc_send_data_head(archiv_doc_head_data)
-    rfc_send_data_items = build_rfc_send_data_items(archiv_doc_detail_list, cost_element_dict)
-
-    extra_data = {
-        "archiv_doc_head_id": archiv_doc_head_data.get("id"),
-        "accounting_document_type": accounting_document_type,
-        "year": year,
-    }
-    return {"head": rfc_send_data_head, "items": rfc_send_data_items, "extra_data": extra_data, "is_pass": is_pass}
+    DATA = {"BUKRS": company_code, "TABLE": table_rows}
+    print(f"===RFC批量请求数据=== {RFC_INTERFACE_CODE}: 凭证 {len(heads)} 条, "
+          f"有明细 {len(doc_meta_list)} 条, 明细行 {len(table_rows)} 行")
+    return DATA, doc_meta_list, zero_meta_list
 
 
 def build_rfc_send_data_head(archiv_doc_head_data):
@@ -840,26 +498,10 @@ def build_rfc_send_data_items(archiv_doc_detail_list, cost_element_dict):
     return items
 
 
-def send_rfc_request(rfc_send_data):
+def send_rfc_request(DATA):
     """发送 RFC 请求 (ZRFC_MH_DOC_POST_MASS)
-
-    传参格式:
-        {"BUKRS": 公司代码, "TABLE": [抬头字段+行项目字段的扁平行]}
+    :param DATA: {"BUKRS": 公司代码, "TABLE": [所有凭证的明细行(各行含本凭证抬头字段 + IP_INDEX)]}
     """
-    global UUID
-
-    head = rfc_send_data.get("head", {}) or {}
-    items = rfc_send_data.get("items", []) or []
-
-    # IP_INDEX 为 RFC 必填序列编号, 同时作为幂等唯一号
-    UUID = head.get("IP_INDEX", "")
-    head_fields = {k: v for k, v in head.items() if k not in ("MANDT", "IP_INDEX")}
-    table_rows = [{**head_fields, **item} for item in items]
-
-    DATA = {
-        "BUKRS": head.get("COMP_CODE", ""),
-        "TABLE": table_rows,
-    }
     print(f"===RFC请求数据=== {RFC_INTERFACE_CODE}: {DATA}")
 
     sap_rfc = SAPRFC()
@@ -871,21 +513,21 @@ def send_rfc_request(rfc_send_data):
     return rfc_resp_data
 
 
-def extract_rfc_response_data(rfc_resp_data, rfc_send_data):
-    """解析 RFC 返回数据(顶层导出参数 MSG_TYP/MSG/BELNR..., 表参数为列表)
-    :return: (type_txt, message_txt, resp_dto_data)
+def extract_rfc_batch_response(rfc_resp_data):
+    """解析批量 RFC 返回(整批共用一个结果)
+    :return: (type_txt, message_txt, external_sn)
     """
     rfc_resp_data = rfc_resp_data or {}
 
-    po_log_id = UUID
     # 消息类型/消息: pyrfc 顶层导出参数 MSG_TYP / MSG (兼容历史 TYPE / msg_typ)
     type_txt = str(rfc_resp_data.get("MSG_TYP") or rfc_resp_data.get("TYPE") or rfc_resp_data.get("msg_typ") or "E")
-    rfc_message_txt = rfc_resp_data.get("MSG") or rfc_resp_data.get("msg") or "RFC接口调用失败"
+    message_txt = rfc_resp_data.get("MSG") or rfc_resp_data.get("msg") or "RFC接口调用失败"
     if type_txt != "S":
         type_txt = "E"
-    message_txt = "凭证创建成功" if type_txt == "S" else rfc_message_txt
+    else:
+        message_txt = "凭证创建成功"
 
-    # 会计凭证号: 优先顶层 BELNR, 否则扫描返回中的表(列表值)逐行取 BELNR/belnr
+    # 会计凭证号: 顶层 BELNR 或返回表内逐行 BELNR
     external_sns = []
     belnr = rfc_resp_data.get("BELNR") or rfc_resp_data.get("belnr") or ""
     if belnr:
@@ -899,126 +541,36 @@ def extract_rfc_response_data(rfc_resp_data, rfc_send_data):
                         if row_belnr:
                             external_sns.append(str(row_belnr))
 
-    resp_dto_data = {
-        "PO_LOG_ID": po_log_id,
-        "summary_unique_number": UUID,                                     # 唯一号
-        "company_code": rfc_send_data["head"].get("COMP_CODE", ""),        # 公司代码
-        "fi_sum_doc_type": rfc_send_data["head"].get("DOC_TYPE", ""),      # 凭证类型
-        "archiv_doc_num": rfc_send_data["head"].get("REF_DOC_NO", ""),     # 参照
-        "external_sn": ",".join(external_sns),                             # 会计凭证号
-        "posting_status": type_txt,                                        # 过账状态
-        "note": message_txt,                                               # 错误信息
-    }
-    return type_txt, message_txt, resp_dto_data
+    return type_txt, message_txt, ",".join(external_sns)
 
 
-# ==================== 共用: 数据加载 / 查询 / 配置 ====================
-def _load_archiv_doc_data(summary_unique_number, company_code, year, archiv_doc_num):
-    """SAP / RFC 两条通道共用的数据加载: 查 head+details -> 值转换 -> 取成本要素
-    :return: (head_data, detail_list, cost_element_dict, is_pass)
-        is_pass=True 表示无明细(金额为0), 调用方据此跳过推送直接落库成功
+# ==================== 查询: 待过账抬头 / 凭证明细 ====================
+def get_pending_archiv_head_list(company_code, year, period):
+    """查询待过账的汇总凭证抬头(company_code/year/period 且 posting_status != 'S')
+    :return: list[dict]
     """
-    archiv_doc_head_data = get_fi_doc_for_archiv_head(db, summary_unique_number, company_code, year, archiv_doc_num)
-    if not archiv_doc_head_data:
-        raise ItfBizError("汇总凭证记录不存在")
-
-    archiv_doc_detail_list = find_fi_doc_for_archiv_details(summary_unique_number, company_code, year)
-    is_pass = not archiv_doc_detail_list
-
-    # 字段转换(按 t_fi_post_erp_value_transfer 配置)
-    for i in get_fi_post_erp_value_transfer_data():
-        if archiv_doc_head_data.get(i["field_name"]) == i["before_value"]:
-            archiv_doc_head_data[i["field_name"]] = i["after_value"]
-        for j in archiv_doc_detail_list:
-            if j.get(i["field_name"]) == i["before_value"]:
-                j[i["field_name"]] = i["after_value"]
-
-    cost_element_dict = get_company_cost_element_info(company_code)
-    return archiv_doc_head_data, archiv_doc_detail_list, cost_element_dict, is_pass
-
-
-def get_fi_doc_for_archiv_head(db, summary_unique_number, company_code, year, archiv_doc_num):
-    """查 t_fi_doc_for_archiv_head 抬头(全字段)
-    :return: 抬头字典(无记录返回 {})
-    """
-    cond = ""
-    if company_code:
-        cond += f" AND company_code='{company_code}'"
-    if archiv_doc_num:
-        cond += f" AND archiv_doc_num='{archiv_doc_num}'"
-    if year:
-        cond += f" AND year='{year}'"
-
-    cond += f" AND summary_unique_number='{summary_unique_number}'"
-    if not cond:
-        return None
-
-    sql = f"""SELECT
-                `id`,
-                `fi_ledger`,
-                `company_code`,
-                `accounting_document_type`,
-                `fi_sum_doc_type`,
-                `archiv_doc_num`,
-                `document_date`,
-                `posting_date`,
-                `year`,
-                `period`,
-                `summary_unique_number`,
-                `transaction_currency`,
-                `basic_currency`,
-                `exchange_rate`,
-                `header_text`,
-                `sum_dr_amount_bc`,
-                `sum_cr_amount_bc`,
-                `posting_status`,
-                `verify_status`,
-                `document_category`,
-                `associated_doc_type`,
-                `attachment_qty`,
-                `posting_person`,
-                `post_time`,
-                `cash_handler`,
-                `settlement_date`,
-                `reference1_head`,
-                `reference2_head`,
-                `create_id`,
-                `create_time`,
-                `update_id`,
-                `update_time`,
-                `note`,
-                `reserved1`,
-                `reserved2`,
-                `reserved3`,
-                `reserved4`,
-                `reserved5`,
-                `reserved6`,
-                `reserved7`,
-                `reserved8`,
-                `reserved9`,
-                `reserved10`
-              FROM `{ARCHIV_HEAD_TABLE}`
-              WHERE 1 = 1 {cond}
-              ORDER BY id DESC; """
-
-    data = db.query_sql(sql)
-    result = data[0] if data else {}
-    return result
+    cond = (
+        f" AND `company_code`='{company_code}'"
+        f" AND `year`='{year}'"
+        f" AND `period`='{period}'"
+        f" AND `posting_status` != 'S'"
+        f" ORDER BY `id` ASC"
+    )
+    return query_db_records_by_cond(db, ARCHIV_HEAD_TABLE, cond, HEAD_COLUMNS)
 
 
 @calc_time
 def find_fi_doc_for_archiv_details(summary_unique_number, company_code, year):
-    """查 t_fi_doc_for_archiv_details 明细(全字段, LEFT JOIN 抬头取 posting_date/exchange_rate)
+    """查某条汇总凭证的明细(全字段, LEFT JOIN 抬头取 posting_date/exchange_rate)
+    :param summary_unique_number: 汇总唯一号(定位单条凭证)
     :return: 明细列表
     """
-    cond = f" AND t1.`summary_unique_number`='{summary_unique_number}' "
+    cond = f" AND t1.`summary_unique_number`='{summary_unique_number}'"
     if company_code:
         cond += f" AND t1.`company_code`='{company_code}'"
     if year:
         cond += f" AND t1.`year`='{year}'"
 
-    if not cond:
-        return []
     sql = f"""
     SELECT
         t1.`id`,
@@ -1132,63 +684,12 @@ def get_company_cost_element_info(company_code):
     return cost_element_info
 
 
-def get_archive_creator(fi_sum_doc_type):
-    """获取财务文档归档默认创建者(带缓存)
-    :return: 配置字典, 不存在返回 {}
-    """
-    global archive_creator_info
-
-    if fi_sum_doc_type not in archive_creator_info:
-        try:
-            query_sql = f"""
-                SELECT `num_object`, `archiv_creater` FROM `t_fi_doc_for_archiv_creater_default`
-                WHERE `accounting_document_type` = '{fi_sum_doc_type}' AND `num_object` = 'FISUM'
-            """
-            data = db.query_sql(query_sql)
-        except Exception as e:
-            print(f"查询t_fi_doc_for_archiv_creater_default失败: {e}")
-            return {}
-
-        result = data[0] if data else {}
-        archive_creator_info[fi_sum_doc_type] = result
-    else:
-        result = archive_creator_info.get(fi_sum_doc_type, {})
-
-    return result
-
-
-def get_interface_configuration(company_code: str, plant_code: str, task_id: str) -> dict:
-    """获取接口配置(按 公司/工厂/任务), 决定 push_system(Oracle/SAP/RFC)
-    :return: {"push_system", "interface_parameter"} 或 {}
-    """
-    global interface_config_cache
-
-    cache_key = f"{company_code}_{plant_code}_{task_id}"
-    if cache_key in interface_config_cache:
-        return interface_config_cache[cache_key]
-
-    query_sql = f"""
-        SELECT
-            `push_system`,
-            `interface_parameter`
-        FROM `t_interface_configuration`
-        WHERE `company_code` = {repr(company_code)} AND `plant_code` = {repr(plant_code)} AND `task_id` = {repr(task_id)}
-    """
-    try:
-        result = db.query_sql(query_sql)
-        config_data = result[0] if result else {}
-        interface_config_cache[cache_key] = config_data
-        return config_data
-    except Exception as e:
-        print(f"查询接口配置失败: {e}")
-        return {}
-
-
-# ==================== 共用: 回写 ====================
+# ==================== 回写 ====================
 def handle_sap_response(resp_dto_data):
-    """处理返回数据: 回写 t_fi_doc_for_archiv_transfer_log"""
-    print(f"===SAP请求成功后处理=== 转换后数据: {resp_dto_data}")
+    """处理返回数据: 回写 transfer_log, 并同步 head 过账状态(供待推送判定/展示)"""
+    print(f"===RFC请求成功后处理=== 转换后数据: {resp_dto_data}")
     save_archiv_doc_transfer_log(resp_dto_data, db)
+    update_archiv_head_status(resp_dto_data, db)
 
 
 def save_archiv_doc_transfer_log(data, db=None):
@@ -1196,6 +697,13 @@ def save_archiv_doc_transfer_log(data, db=None):
     cond = f" AND company_code='{data.get('company_code')}' AND year='{data.get('year')}' AND summary_unique_number='{data.get('summary_unique_number')}'"
     update_cols = ("external_sn", "posting_status", "update_id", "update_time", "note")
     update_db_record_by_cond(db, TRANSFER_LOG_TABLE, cond, update_cols, data)
+
+
+def update_archiv_head_status(data, db=None):
+    """同步更新 head 过账状态/备注(让 posting_status!='S' 的待推送判定生效)"""
+    cond = f" AND company_code='{data.get('company_code')}' AND year='{data.get('year')}' AND summary_unique_number='{data.get('summary_unique_number')}'"
+    update_cols = ("posting_status", "note", "update_id", "update_time")
+    update_db_record_by_cond(db, ARCHIV_HEAD_TABLE, cond, update_cols, data)
 
 
 # ==================== Test ====================
@@ -1213,22 +721,16 @@ Test_send_fi_archiv_doc_payload = {'data': {'id': 24, 'task_code': '178090536875
 
 
 def Test_send_fi_archiv_doc():
-    # """会计凭证过账推送接口 测试入口(走多分支派发)"""
-    # user_id = "testUser"
-    # payload = Test_send_fi_archiv_doc_payload
-    # data = payload.get("data", {}) if isinstance(payload, dict) else {}
-    # task_id = data.get("task_id")
-    # plant_code = data.get("plant_code")
-    # response = send_fi_archiv_doc(payload, user_id, task_id, plant_code)
-    # print(f"===会计凭证过账推送接口=== 测试返回: {response}")
-    # return response
-
+    """会计凭证过账推送接口 测试入口"""
     user_id = "test_user"
-    special_sign = True
-    send_data = Test_send_fi_archiv_doc_payload
-    print("===会计凭证过账推送接口=== 推送RFC系统...")
-    response = send_fi_archiv_doc_to_rfc(send_data, user_id=user_id, special_sign=special_sign)
-    return response
+    payload = Test_send_fi_archiv_doc_payload.get("data", {}) if isinstance(Test_send_fi_archiv_doc_payload, dict) else {}
+    company_code = payload.get("company_code", "")
+    year = payload.get("year", "")
+    period = payload.get("period", "")
+    res_bus = send_fi_archiv_doc_core(user_id, None, company_code, year, period)
+    print(f"===会计凭证过账推送接口=== 测试返回: {res_bus}")
+    return res_bus
+
 
 if __name__ == '__main__':
     Test_send_fi_archiv_doc()
