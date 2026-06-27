@@ -358,3 +358,32 @@ def ZZEXT_aux_mat_cost_post_push_query(db, body):
 
     print('res_data:', res_data)
     return res_data
+    
+#凭证推送
+def ZZEXTPostPushSAP(user_id, task_id, plant_code, item,log_code,help_text):
+    """
+    凭证推送sap 扩展
+    task_id 601
+    log_code 03003E0001
+    help_text 工单投入明细凭证推送SAP
+    """
+    archive_doc_num = item.get('archiv_doc_num') or ''
+    company_code = item.get('company_code') or ''
+    time_timestamp = str(datetime.now().timestamp()).split(".")[0]
+    random_number = str(random.randint(00000, 99999))
+    guid = f"PostPushSAP_{log_code}" + time_timestamp + random_number
+    payload = {
+        "guid": guid,
+        "data": {
+            "summary_unique_number": item.get('summary_unique_number') or '',  # 汇总唯一号
+            "company_code": item.get('company_code') or '',  # 公司代码
+            "year": item.get('year') or '',  # 过账年度
+            "archiv_doc_num": archive_doc_num,  # 归档凭证编号
+        }
+    }
+    start_time = time.time()
+    resp = send_fi_archiv_doc(payload, user_id, task_id, plant_code)
+    print("send_fi_archiv_doc_to_sap end time:", time.time() - start_time)
+    code, each_msg = process_resp_result(resp, archive_doc_num, payload, log_code, help_text, plant_code, company_code)
+    print("process end time:", time.time() - start_time)
+    return code, each_msg
