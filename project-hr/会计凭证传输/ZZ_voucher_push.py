@@ -40,8 +40,9 @@ from ToolsMethods import (
     get_total_count,
 )
 from utils import ItfBizError, update_db_record_by_cond
-from ZZEXT_SapRFC import SAPRFC
-from ZZEXT_SendRequest import SendToSap
+
+# from ZZEXT_SapRFC import SAPRFC
+# from ZZEXT_SendRequest import SendToSap
 
 archive_creator_info = {}
 interface_config_cache = {}
@@ -78,6 +79,86 @@ DISPLAY = [
     {"field": "external_sn", "description": "会计凭证号"},
     {"field": "note", "description": "备注"},
 ]
+
+
+
+import pyrfc
+from libenhance import get_cnf
+from logger import LoggerConfig
+
+usprint = LoggerConfig()
+
+
+class SAPRFC:
+    def __init__(self):
+        # 从配置文件获取SAP连接参数
+        ashost = get_cnf("rfc.ashost")
+        sysnr = get_cnf("rfc.sysnr")
+        client = get_cnf("rfc.client")
+        user = get_cnf("rfc.user")
+        passwd = get_cnf("rfc.passwd")
+        lang = get_cnf("rfc.lang")  # 默认中文
+        trace = get_cnf("rfc.trace")  # 默认不追踪
+
+        try:
+            self.connection = pyrfc.Connection(
+                ashost=ashost,
+                sysnr=sysnr,
+                client=client,
+                user=user,
+                passwd=passwd,
+                lang=lang,
+                trace=trace
+            )
+            usprint.printInfo('SAPRFC', f"SAP连接成功: {ashost}, 系统编号: {sysnr}")
+        except Exception as e:
+            raise Exception(f"SAP RFC连接异常: {e}")
+
+    def call(self, rfc_name, params=None):
+        """
+        调用RFC函数
+        :param rfc_name: RFC函数名称
+        :param params: 输入参数字典（可选）
+        :return: 返回结果字典
+        """
+        try:
+            if params:
+                result = self.connection.call(rfc_name, **params)
+            else:
+                result = self.connection.call(rfc_name)
+
+            usprint.printInfo('SAPRFC', f"调用 {rfc_name} 成功")
+            return result
+
+        except pyrfc.ABAPApplicationError as e:
+            usprint.printInfo('SAPRFC', f"ABAP应用错误 - {rfc_name}: {e}")
+            raise
+        except pyrfc.CommunicationError as e:
+            usprint.printInfo('SAPRFC', f"通信错误 - {rfc_name}: {e}")
+            raise
+        except pyrfc.LogonError as e:
+            usprint.printInfo('SAPRFC', f"登录错误 - {rfc_name}: {e}")
+            raise
+        except Exception as e:
+            usprint.printInfo('SAPRFC', f"调用 {rfc_name} 失败: {e}")
+            raise
+
+    def close(self):
+        """关闭SAP连接"""
+        try:
+            if self.connection:
+                self.connection.close()
+                usprint.printInfo('SAPRFC', "SAP连接已关闭")
+        except Exception as e:
+            usprint.printInfo('SAPRFC', f"关闭连接异常: {e}")
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 
 
 # ---------- 公共参数校验(推送 / 查询 共用) ----------
@@ -486,7 +567,7 @@ def build_rfc_items(detail_list, cost_element_dict):
             alloc_nmbr = "{} {}".format(item.get("mat_doc_sn", ""), item.get("mat_doc_items", "")).strip()
 
         items.append({
-            "ITEMNO_ACC": item.get("summary_line", ""),                      # 行项目编号(=汇总行号)
+            "ITEMNO_ACC": str(item.get("summary_line") or ""),               # 行项目编号(=汇总行号, NUMC必须str)
             "BSCHL": "40" if is_debit else "50",                             # 过账代码 Dr->40/Cr->50
             "GL_ACCOUNT": str(item.get("accounting_subjects") or ""),        # 总账科目
             "SP_GL_IND": "",                                                 # 特别总账标志
@@ -504,8 +585,8 @@ def build_rfc_items(detail_list, cost_element_dict):
             "WBS_ELEMENT": projk if is_cost_elem else "",                    # WBS元素
             "TAX_CODE": "",                                                  # 税码
             "MATERIAL": str(item.get("mat_code") or ""),                     # 物料编号
-            "QUANTITY": item.get("basic_uom") or 0,                          # 数量
-            "MEINS": "" if not item.get("basic_qty") else item.get("basic_qty"),  # 基本计量单位
+            # "QUANTITY": int(item.get("basic_uom") or 0),                    # 数量(QUAN, 统一传str)
+            "MEINS": str(item.get("basic_qty") or ""),                       # 基本计量单位(UNIT, 统一传str)
             "TRADE_ID": str(item.get("trade_partner_code") or ""),           # 贸易伙伴
             "PMNTTRMS": str(item.get("payment_terms") or ""),                # 付款条件
             "BLINE_DATE": _to_ymd(item.get("baseline_date")),                # 到期日计算基准日期
