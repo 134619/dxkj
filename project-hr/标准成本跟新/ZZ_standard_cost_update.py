@@ -232,7 +232,13 @@ def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_co
         try:
             sap_send_data = prepare_price_change_request(records)
             print("----------------", sap_send_data)
+            # sap_send_data = {'MATERIAL': 'F010577600103', 'VALUATIONAREA': 'RAC1', 'P_RELEASE': 'X', 'PRICES': 
+            # [{'VALUATION_VIEW': '0', 'CURR_TYPE': '10', 'PRICE': 35.0, 'CURRENCY': 'CNY',
+            #  'PRICE_UNIT': "EA"}, 
+            #  {'VALUATION_VIEW': '0', 'CURR_TYPE': '30', 'PRICE': 35.0, 'CURRENCY': 'CNY', 'PRICE_UNIT': "EA"}]}
+
             sap_resp = send_price_change_request(sap_send_data)
+            # print("++++++++++++++++++++++",sap_resp)
             # 解析(整批共用一个返回结果)
             resp = extract_price_change_response(sap_resp)
             # 逐条回写
@@ -444,7 +450,9 @@ def prepare_price_change_request(records):
     for record in records:
         price = _parse_amount(record.get("standard_cost_bc"))
         currency = record.get("basic_currency", "") or ""
-        price_unit = _parse_amount(record.get("price_unit")) or 1
+        price_unit = _parse_amount(record.get("price_unit"))
+        # price_unit = record.get("basic_uom") or "EA"
+        print("------------------1111")
         for curr_type in CURR_TYPES:  # ("10", "30")
             prices.append({
                 "VALUATION_VIEW": "0",        # 评估视图(NUMC), 固定"0"
