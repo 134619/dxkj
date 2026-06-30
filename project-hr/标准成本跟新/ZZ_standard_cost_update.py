@@ -11,10 +11,7 @@
   接口说明：  标准成本更新, 调SAP (ZBAPI_MATVAL_PRICE_CHANGE)
              将标准成本数据推送至SAP进行更新,
              并将更新结果回写至 t_sap_mmd_standard_price。
-
-  收发方式参照 ZZ_wip_variance_adjust_posting.py:
-    入口 Request().body() 取参, Response.set_body/commit 返回;
-    返回体 {code, msg, data, display}, 查询支持 _payload_ 过滤/排序/分页/导出。
+    返回体 {code, msg, data, display}, _payload_ 过滤/排序/分页/导出。
 """
 import json
 import traceback
@@ -125,10 +122,6 @@ class SAPRFC:
         except Exception:
             pass
 
-
-
-
-
 # ---------- 公共参数校验(posting / query 共用) ----------
 def validate_standard_cost_params(data):
     """校验标准成本更新接口的公共参数(plant_code / year / period), mat_code 可选
@@ -219,48 +212,35 @@ def standard_cost_update_core(user_id, task_id, year, period, plant_code, mat_co
     records = get_standard_cost_update_list(plant_code, year, period, mat_code)
     print("待更新记录--", records)
 
-    # 暂不按 物料+工厂 分组
-    # # 按 物料+工厂 分组: 同一物料的多条价格记录合并到一次调用(MATERIAL 为标量, 单次一个物料)
-    # groups = {}
-    # for record in records:
-    #     key = (record.get("mat_code", ""), record.get("plant_code", ""))
-    #     groups.setdefault(key, []).append(record)
-
-    # 一次性推送: 所有记录合并到一次调用(PRICES 含全部价格行; MATERIAL/VALUATIONAREA 取首条, 需为同一物料)
+    # 逐条推送: MATERIAL/VALUATIONAREA 为标量(单次只改一个物料), 故每条记录单独调一次 RFC,
+    # 各自组装/发送/解析/回写, 单条失败不影响其余。
     total = len(records)
     if total:
-        try:
-            sap_send_data = prepare_price_change_request(records)
-            print("----------------", sap_send_data)
-            # sap_send_data = {'MATERIAL': 'F010577600103', 'VALUATIONAREA': 'RAC1', 'P_RELEASE': 'X', 'PRICES': 
-            # [{'VALUATION_VIEW': '0', 'CURR_TYPE': '10', 'PRICE': 35.0, 'CURRENCY': 'CNY',
-            #  'PRICE_UNIT': "EA"}, 
-            #  {'VALUATION_VIEW': '0', 'CURR_TYPE': '30', 'PRICE': 35.0, 'CURRENCY': 'CNY', 'PRICE_UNIT': "EA"}]}
-
-            sap_resp = send_price_change_request(sap_send_data)
-            # print("++++++++++++++++++++++",sap_resp)
-            # 解析(整批共用一个返回结果)
-            resp = extract_price_change_response(sap_resp)
-            # 逐条回写
-            for record in records:
+        succ, fail_msgs = 0, []
+        for record in records:
+            mat = record.get("mat_code", "")
+            try:
+                sap_send_data = prepare_price_change_request([record])   # 单条记录 -> 一次调用
+                print("----------------", sap_send_data)
+                sap_resp = send_price_change_request(sap_send_data)
+                resp = extract_price_change_response(sap_resp)
                 update_standard_price(record, resp, user_id)
-            if str(resp.get("p_ret")) == "2":
-                code, msg = 200, f"更新成功 {total} 条"
-            else:
-                code = 206
-                msg = f"更新失败 {total} 条; {resp.get('p_msg') or 'SAP返回失败'}"
-        except Exception as e:
-            traceback.print_exc()
-            code = 206
-            msg = f"更新异常 {total} 条; {e}"
-            # 异常时把整批置为失败
-            fail_resp = {
-                "ml_doc_num": "",
-                "p_msg": str(e),
-                "p_ret": "3",
-            }
-            for record in records:
-                update_standard_price(record, fail_resp, user_id)
+                if str(resp.get("p_ret")) == "2":
+                    succ += 1
+                else:
+                    fail_msgs.append(f"{mat}: {resp.get('p_msg') or 'SAP返回失败'}")
+            except Exception as e:
+                traceback.print_exc()
+                # 该条异常单独置失败, 继续下一条
+                update_standard_price(record, {"ml_doc_num": "", "p_msg": str(e), "p_ret": "3"}, user_id)
+                fail_msgs.append(f"{mat}: {e}")
+
+        fail = total - succ
+        if fail == 0:
+            code, msg = 200, f"更新成功 {succ} 条"
+        else:
+            detail = "; ".join(fail_msgs[:5]) + (" ..." if len(fail_msgs) > 5 else "")
+            code, msg = 206, f"更新成功 {succ}/{total} 条; 失败: {detail}"
 
     # 回查最终状态(供前端刷新表格)
     data, display = standard_cost_update_query_data(body)
@@ -539,16 +519,17 @@ def _parse_amount(value):
         return 0.0
 
 
-Text_semiproduct_deduct_push_payload = {'data': {'id': 24, 'task_code': '1780905368759', 
-'step': '09-00', 'task_id': 602, 'up_task_id': 0, 
-'step_name': '在制差异调整过账', 'status': '1', 'excute_user': '', 
-'operator_time': '', 'create_id': 1004, 'create_time': '2026-06-18 16:01:29', 
-'update_id': 1004, 'update_time': '2026-06-18 16:01:29', 'note': '', 
-'order_num': 9, 'action_type': '', 'progress': '0/0', 'percent': '0%', 
-'plant_code': 'RAC1', 'description': '润安模拟月结', 'year': '2026', 
-'period': '06', 'cost_area': 'CRM', 'cost_version': '0', 'version_description': '核算版本', 
-'task_info': [{'company_code': 'RACQ', 'plant_code': ['RAC0', 'RAC1']}], 'company_code_list': [{'value': 'RACQ', 'description': '华润润安公司', 'label': 'RACQ 华润润安公司'}], 'plant_code_list': [{'value': 'RAC0', 'description': '华润润安无价值工厂', 'label': 'RAC0 华润润安无价值工厂'}, {'value': 'RAC1', 'description': '华润润安有价值工厂', 'label': 'RAC1 华润润安有价值工厂'}], 'label': '1780905368759 润安模拟月结', 'value': '1780905368759', 'company_code': 'RACQ', 'company_code_desc': '华润润安公司', 'task_code_desc': '润安模拟月结', 'condition': {'task_code': '1780905368759', 'description': '润安模拟月结', 'year': '2026', 'period': '06', 'cost_area': 'CRM', 'cost_area_description': '润安成本管理组织', 'cost_version': '0', 'version_description': '核算版本', 'status': '1', 'task_info': [{'company_code': 'RACQ', 'plant_code': ['RAC0', 'RAC1']}], 'company_code_list': [{'value': 'RACQ', 'description': '华润润安公司', 'label': 'RACQ 华润润安公司'}], 'plant_code_list': [{'value': 'RAC0', 'description': '华润润安无价值工厂', 'label': 'RAC0 华润润安无价值工厂'}, {'value': 'RAC1', 'description': '华润润安有价值工厂', 'label': 'RAC1 华润润安有价值工厂'}], 'label': '1780905368759 润安模拟月结', 'value': '1780905368759', 'company_code': 'RACQ', 'company_code_desc': '华润润安公司', 'plant_code': 'RAC0', 'task_code_desc': '润安模拟月结'}, 'type': 'query'}}
+Text_semiproduct_deduct_push_payload = {
+    'data': {
+        'id': 24, 'task_code': '1780905368759', 'task_id': 602, 
+        'plant_code': 'RAC1', 'year': '2026', 
+        'period': '06'}}
 
+
+
+
+
+#————————————————————text测试————————————————————
 
 def Text_standard_cost_update():
     """标准成本更新接口 按钮 测试"""
@@ -568,7 +549,7 @@ def Text_standard_cost_update():
     print(f"===标准成本更新接口=== 处理结束!!! 返回: {res_bus}")
     return
 
+
+
 if __name__ == "__main__":
-
-
     Text_standard_cost_update()

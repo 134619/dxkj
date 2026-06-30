@@ -211,7 +211,6 @@ def voucher_push():
     req = Request()
     res = Response()
     body = json.loads(req.body())
-    print("body---", body)
     user_id = req.header("user_id") or ""
 
     payload = body.get("data") or {}
@@ -553,6 +552,7 @@ def build_rfc_items(detail_list, cost_element_dict):
     for item in detail_list:
         amount_tc = float(item.get("dc_amount_tc") or 0)   # 凭证货币金额
         amount_bc = float(item.get("dc_amount_bc") or 0)   # 本币金额
+        transaction_currency_amount = float(item.get("transaction_currency_amount"))  # 本币金额
         dcm = str(item.get("debit_credit_mark") or "").strip()
         is_debit = dcm.upper().startswith("D")             # Dr 借 / Cr 贷
 
@@ -573,7 +573,7 @@ def build_rfc_items(detail_list, cost_element_dict):
             "SP_GL_IND": "",                                                 # 特别总账标志
             "CS_TRANS_T": str(item.get("asset_business_type") or ""),        # 事务类型
             "DE_CRE_IND": "S" if is_debit else "H",                          # 借/贷标识 Dr->S/Cr->H
-            "AMT_DOCCUR": str(round(amount_bc, 2)),                          # 以本币计的金额
+            "AMT_DOCCUR": str(round(transaction_currency_amount, 2)),                          # 以本币计的金额
             "WRBTR": str(round(amount_tc, 2)),                               # 凭证货币金额
             "WAERS": "",                                                     # 货币码(抬头CURRENCY已传)
             "ITEM_TEXT": str(item.get("item_text") or ""),                   # 项目文本
@@ -750,7 +750,7 @@ def find_fi_doc_for_archiv_details(summary_unique_number, company_code, year):
                      t1.`asset_code1`,t1.`asset_code2`,t1.`asset_business_type`,
                      t1.`profit_center`,t1.`item_text`,t1.`mat_code`,t1.`trade_partner_code`,
                      t1.`payment_terms`,t1.`baseline_date`,t1.`basic_uom`,t1.`basic_qty`,
-                     t1.`so_sn`,t1.`so_items`,
+                     t1.`so_sn`,t1.`so_items`,t1.`transaction_currency_amount`,
                      t2.`fi_sum_doc_type`,t2.`posting_date`,t2.`exchange_rate`
               FROM `{ARCHIV_DETAIL_TABLE}` AS t1
               LEFT JOIN `{ARCHIV_HEAD_TABLE}` AS t2
