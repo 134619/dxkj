@@ -12,7 +12,7 @@
              并将物料凭证号/年度/状态/消息回写至 t_co_summary_result。
   源表:       t_co_summary_report(扣料明细)
   结果表:     t_co_summary_result(过账结果)
-  中间表:     ZMES_MM_GNRTRANS (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
+  中间表:     ZMES_MM_GNRTRANS_MHXT (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
 """
 import json
 import traceback
@@ -20,7 +20,6 @@ from datetime import datetime
 
 from DbHelper import DbHelper
 from libenhance import Request, Response, get_cnf
-from OracleDB import OracleDB, get_schema
 from ToolsMethods import (
     GetExportData,
     Paginator,
@@ -30,7 +29,9 @@ from ToolsMethods import (
     generate_raw_sql,
 )
 from utils import query_db_records_by_cond, update_db_record_by_cond
-from ZZEXT_SapRFC import SAPRFC
+from ZZEXT_OracleHandle import OracleDB, get_schema
+
+# from ZZEXT_SapRFC import SAPRFC
 
 db = DbHelper()
 
@@ -42,12 +43,11 @@ INTERFACE_NAME = "搭BOM材料扣料接口"
 
 # MES与SAP接口编号 / 中间表
 IP_NO = "MES_MM_011"
-MID_TABLE = "ZMES_MM_GNRTRANS"            # Oracle 中间表(秘火先 INSERT, 再调 RFC)
+MID_TABLE = "ZMES_MM_GNRTRANS_MHXT"            # Oracle 中间表(秘火先 INSERT, 再调 RFC)
 PROCESS_FLG_INIT = "5"                    # 秘火写入中间表时的初始状态(SAP 成功置 2 / 失败置 D)
 MANDT = get_cnf("rfc.client")             # SAP 集团号(=RFC client, 生产 801 / 测试 500)
-print("公司集团号---",MANDT)
 
-# 中间表 ZMES_MM_GNRTRANS 列(按接口文档 v1.1, 成本中心领用: 无 AUFNR, 含 INSMK/SAKTO/ZTEXT3/BUDAT)
+# 中间表 ZMES_MM_GNRTRANS_MHXT 列(按接口文档 v1.1, 成本中心领用: 无 AUFNR, 含 INSMK/SAKTO/ZTEXT3/BUDAT)
 MID_TABLE_COLUMNS = [
     "MANDT", "IP_NO", "IP_INDEX", "ZCOUNT", "MATNR", "WERKS", "BWART",
     "INSMK", "ERFMG", "ERFME", "S_LGORT", "S_CHARG",
@@ -56,7 +56,8 @@ MID_TABLE_COLUMNS = [
 ]
 
 # BAPI 货物移动事务代码 / 公司代码 / 工厂
-GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
+# GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
+GM_CODE = "11"                      # 在润工作上沟通过，
 BUKRS = "RACQ"                      # P_BUKRS 固定 RACQ
 PLANT_DEFAULT = "RAC1"              # 工厂(文档固定值 RAC1)
 USRID = "MH"                        # 用户名(文档固定 MH)
@@ -71,9 +72,89 @@ MOVE_TYPE_POS = "201"               # 缺失时兜底
 SOURCE_TABLE = "t_co_summary_report"
 RESULT_TABLE = "t_co_summary_result"
 
-# IP_INDEX 生成规则: HMH + YYYYMMDD + 5位流水
+# IP_INDEX 生成规则: HMH + YYMMDD + 5位流水(共14位)
 IPINDEX_PREFIX = "HMH"
 IPINDEX_SEQ_WIDTH = 5
+
+
+
+
+import pyrfc
+from libenhance import get_cnf
+from logger import LoggerConfig
+
+usprint = LoggerConfig()
+
+
+class SAPRFC:
+    def __init__(self):
+        # 从配置文件获取SAP连接参数
+        ashost = get_cnf("rfc.ashost")
+        sysnr = get_cnf("rfc.sysnr")
+        client = get_cnf("rfc.client")
+        user = get_cnf("rfc.user")
+        passwd = get_cnf("rfc.passwd")
+        lang = get_cnf("rfc.lang")  # 默认中文
+        trace = get_cnf("rfc.trace")  # 默认不追踪
+
+        try:
+            self.connection = pyrfc.Connection(
+                ashost=ashost,
+                sysnr=sysnr,
+                client=client,
+                user=user,
+                passwd=passwd,
+                lang=lang,
+                trace=trace
+            )
+            usprint.printInfo('SAPRFC', f"SAP连接成功: {ashost}, 系统编号: {sysnr}")
+        except Exception as e:
+            raise Exception(f"SAP RFC连接异常: {e}")
+
+    def call(self, rfc_name, params=None):
+        """
+        调用RFC函数
+        :param rfc_name: RFC函数名称
+        :param params: 输入参数字典（可选）
+        :return: 返回结果字典
+        """
+        try:
+            if params:
+                result = self.connection.call(rfc_name, **params)
+            else:
+                result = self.connection.call(rfc_name)
+
+            usprint.printInfo('SAPRFC', f"调用 {rfc_name} 成功")
+            return result
+
+        except pyrfc.ABAPApplicationError as e:
+            usprint.printInfo('SAPRFC', f"ABAP应用错误 - {rfc_name}: {e}")
+            raise
+        except pyrfc.CommunicationError as e:
+            usprint.printInfo('SAPRFC', f"通信错误 - {rfc_name}: {e}")
+            raise
+        except pyrfc.LogonError as e:
+            usprint.printInfo('SAPRFC', f"登录错误 - {rfc_name}: {e}")
+            raise
+        except Exception as e:
+            usprint.printInfo('SAPRFC', f"调用 {rfc_name} 失败: {e}")
+            raise
+
+    def close(self):
+        """关闭SAP连接"""
+        try:
+            if self.connection:
+                self.connection.close()
+                usprint.printInfo('SAPRFC', "SAP连接已关闭")
+        except Exception as e:
+            usprint.printInfo('SAPRFC', f"关闭连接异常: {e}")
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 # ---------- 公共参数校验(posting / query 共用) ----------
 def validate_deduct_params(data):
@@ -178,7 +259,7 @@ def bom_material_deduct_push_core(user_id, task_id, year, period, plant_code):
     if record_cnt:
         ip_index = generate_ipindex()
         try:
-            # 1) 先把扣料明细写入 SAP 中间表 ZMES_MM_GNRTRANS(PROCESS_FLG=5)
+            # 1) 先把扣料明细写入 SAP 中间表 ZMES_MM_GNRTRANS_MHXT(PROCESS_FLG=5)
             insert_mid_table(unique_records, ip_index)
             # 2) 用同一个 IP_INDEX 调 SAP 货物移动 RFC
             sap_send_data = prepare_gm_request(unique_records, ip_index)
@@ -390,23 +471,29 @@ def prepare_gm_request(records, ip_index):
 
 
 def insert_mid_table(records, ip_index):
-    """把扣料明细写入 Oracle 中间表 ZMES_MM_GNRTRANS(PROCESS_FLG=5)
+    """把扣料明细写入 Oracle 中间表 ZMES_MM_GNRTRANS_MHXT(PROCESS_FLG=5)
 
-    参考 SummaryCertificate.py 的 `insert all ... select 1 from dual` 写法。
     一批记录共用同一个 IP_INDEX, 用 ZCOUNT(1..N) 区分行项目。
+    通过 ZZEXT_OracleHandle(OracleDB) 操作中间库, 连接与 schema 均走 zjk.* 配置。
     说明: IP_INDEX 每次推送都新生成(generate_ipindex, 时间戳唯一), 不与历史记录冲突,
           故无需 DELETE 旧记录(Oracle 账号无删除权限); 失败遗留的 PROCESS_FLG=5 行
           不会被新 IP_INDEX 命中, 不影响重推。
     :return: 受影响行数; 写入失败抛异常。
     """
     schema = get_schema()
-    table = "{schema}.{tbl}".format(schema=schema, tbl=MID_TABLE) if schema else MID_TABLE
+    # 远程中间表引用方式(按实际报错切换):
+    #   1) schema 前缀:     table = "{s}.{t}".format(s=schema, t=MID_TABLE)   ← 当前
+    #   2) 裸名(走同义词):  table = MID_TABLE
+    #   3) dblink:          table = "{t}@{s}".format(t=MID_TABLE, s=schema)
+    table = "{s}.{t}".format(s=schema, t=MID_TABLE) if schema else MID_TABLE
     oracle = OracleDB()
     try:
         now = datetime.now()
         datum, uzeit = now.strftime("%Y%m%d"), now.strftime("%H%M%S")
 
-        insert_sql = "insert all "
+        # 中间表是远程表(经 dblink/网关), INSERT ALL...SELECT 与 DDL 都不被支持(ORA-02021),
+        # 故改为逐行单条 INSERT INTO ... VALUES。
+        row_count = 0
         for idx, record in enumerate(records, start=1):
             row = {
                 "MANDT": MANDT or "",
@@ -431,6 +518,7 @@ def insert_mid_table(records, ip_index):
                 "SAKTO": record.get("cost_element", ""),                           # 总账科目/成本要素
                 "BUDAT": _to_ymd(record.get("summary_date")) or datum,              # 过账日期(汇总日期)
             }
+            
             vals = []
             for col in MID_TABLE_COLUMNS:
                 v = row[col]
@@ -438,13 +526,16 @@ def insert_mid_table(records, ip_index):
                     vals.append(str(v))                       # 数值列: 裸数字字面量
                 else:
                     vals.append(repr(str(v)) if v not in (None, "") else "NULL")
-            insert_sql += " into {t} ({cols}) values ({v}) ".format(
+            insert_sql = "insert into {t} ({cols}) values ({v})".format(
                 t=table, cols=",".join(MID_TABLE_COLUMNS), v=",".join(vals))
-        insert_sql += " select 1 from dual"
-        print("insert_sql---",insert_sql)
-        row_count = oracle.execute(insert_sql)
+            n = oracle.execute(insert_sql)
+            if not n:
+                raise Exception("中间表 {tbl} 写入失败(ip_index={ip}, 第{idx}行)".format(
+                    tbl=MID_TABLE, ip=ip_index, idx=idx))
+            row_count += n
         if not row_count:
             raise Exception("中间表 {tbl} 写入失败(ip_index={ip})".format(tbl=MID_TABLE, ip=ip_index))
+        print("中间表 {tbl} 写入成功(ip_index={ip}, 影响行数={n})".format(tbl=MID_TABLE, ip=ip_index, n=row_count))
         return row_count
     finally:
         oracle.close()
@@ -482,14 +573,16 @@ def build_gm_item(record, idx):
 
 
 def generate_ipindex():
-    """生成 IP_INDEX: HMH + YYYYMMDD + 5位流水
+    """生成 IP_INDEX: HMH + YY + MM + DD + 5位流水(共14位)
 
-    流水号需保证全局唯一, 正式应取中间表最大流水+1 或独立序列;
-               这里先用时间戳末5位兜底。
+       格式: HMH(3) + 年2(YY) + 月2(MM) + 日2(DD) + 流水5 = 14 位(中间表 IP_INDEX 列宽 14)。
+       唯一性: HMH 前缀区分系统, 避免与其他系统 IP_INDEX 冲突; 流水号保证同日内不重复。
+       流水号需全局唯一, 正式应取中间表最大流水+1 或独立序列;
+               这里先用时间戳末5位兜底, 仅供联调。
     """
     now = datetime.now()
     seq = str(int(now.timestamp()) % (10 ** IPINDEX_SEQ_WIDTH)).zfill(IPINDEX_SEQ_WIDTH)
-    return f"{IPINDEX_PREFIX}{now.strftime('%Y%m%d')}{seq}"
+    return f"{IPINDEX_PREFIX}{now.strftime('%y%m%d')}{seq}"
 
 
 def send_gm_request(sap_send_data):
@@ -548,6 +641,7 @@ def update_summary_result(records, resp):
         }
         cols = ("associated_doc_sn", "year", "status", "post_account_msg", "update_time")
         update_db_record_by_cond(db, RESULT_TABLE, cond, cols, data)
+    db.dbCommit()
 
 
 # ---------- 工具 ----------
@@ -570,3 +664,48 @@ def _to_ymd(date_value):
         return text[:8]
     except Exception:
         return ""
+
+
+
+# ==================== Test ====================
+Text_bom_material_deduct_push_payload = {
+    "_payload_": {
+        "sort_info": [],
+        "filter_info": {},
+        "group_info": [],
+        "statistic_info": [],
+        "page": {"page_size": 0, "page_num": 1},
+        "export_excel": "false"
+    },
+    "data": {
+        "plant_code": "RAC1",
+        "year": "2026",
+        "period": "06",
+        "task_id": 605
+    }
+}
+
+
+@calc_time
+def Text_bom_material_deduct_push():
+    """搭BOM材料扣料推送接口 测试
+    task_id 604
+    """
+    print("===搭BOM材料扣料推送接口===")
+    user_id = 'testuser'
+    payload = Text_bom_material_deduct_push_payload.get("data") or {}
+    task_id = payload.get("task_id") or 604
+
+    # 公共参数校验, 失败直接返回
+    ok, msg, params = validate_deduct_params(payload)
+    if not ok:
+        print(f"===搭BOM材料扣料推送接口=== 参数校验失败: {msg}")
+        return
+    res_bus = bom_material_deduct_push_core(
+        user_id, task_id, params["year"], params["period"], params["plant_code"]
+    )
+    print(f"===搭BOM材料扣料推送接口=== 处理结束!!! 返回: {res_bus}")
+    return res_bus
+
+if __name__ == "__main__":
+    Text_bom_material_deduct_push()

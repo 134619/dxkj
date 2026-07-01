@@ -303,10 +303,8 @@ def get_month_task_info(data):
         task_code = data.pop('task_code')
     if 'step' in data:
         step = data.pop('step')
-
     valid_fields = ['year', 'period', 'plant_code']
     filter_condition = {field: data.get(field) for field in valid_fields}
-
     return filter_condition, task_code, step
 
 

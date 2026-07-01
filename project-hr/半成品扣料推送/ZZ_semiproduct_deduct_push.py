@@ -51,14 +51,21 @@ PROCESS_FLG_INIT = "5"                    # 秘火写入中间表时的初始状
 MANDT = get_cnf("rfc.client")             # SAP 集团号(=RFC client, 生产 801 / 测试 500)
 
 # 中间表 ZMES_MM_GOODSREC_MHXT 列(按接口文档 v1.1)
+# MID_TABLE_COLUMNS = [
+#     "MANDT", "IP_NO", "IP_INDEX", "AUFNR", "ZCOUNT", "BWART", "WERKS", "MATNR",
+#     "ERFMG", "ERFME", "CHARG", "ZUSER", "DATUM_B", "UZEIT_B", "ZDATE", "ZTIME",
+#     "BUKRS", "USRID", "PROCESS_FLG", "LGORT",
+# ]
+
 MID_TABLE_COLUMNS = [
     "MANDT", "IP_NO", "IP_INDEX", "AUFNR", "ZCOUNT", "BWART", "WERKS", "MATNR",
-    "ERFMG", "ERFME", "CHARG", "ZUSER", "DATUM_B", "UZEIT_B", "ZDATE", "ZTIME",
-    "BUKRS", "USRID", "PROCESS_FLG", "LGORT",
+    "ERFMG", "ERFME", "CHARG", "ZUSER", "ZDATE", "ZTIME", "BUKRS", "USRID", "PROCESS_FLG", "LGORT",
 ]
 
+
+
 # BAPI 货物移动事务代码 / 公司代码 / 工厂 / 存储地点
-GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
+GM_CODE = "11"                      # P_CODE.GM_CODE 固定值 03(MB1A)
 BUKRS = "RACQ"                      # P_BUKRS 固定 RACQ
 PLANT_DEFAULT = "RAC1"              # 工厂(文档固定值 RAC1)
 STGE_LOC_DEFAULT = "0050"           # 存储地点(文档固定值 0050)
@@ -262,7 +269,6 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
     # 正向(261)必须先于反向(262)传送, 同向按 id(创建先后)升序
     unique_records.sort(key=lambda r: (str(r.get("movement_type")) == MOVE_TYPE_NEG, r.get("id") or 0))
 
-
     print("去重后记录--", unique_records)
     record_cnt = len(unique_records)
     # ===== 一次性全推送: 先 INSERT Oracle 中间表, 再一次调 RFC =====
@@ -271,6 +277,8 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
         try:
             # 1) 先把扣料明细写入 SAP 中间表 ZMES_MM_GOODSREC_MHXT(PROCESS_FLG=5)
             insert_mid_table(unique_records, ip_index)
+            # 1.5) INSERT 后回查开始/结束 时间字段(DATUM_B/DATUM_E/UZEIT_B/UZEIT_E)
+            query_mid_table_times(ip_index)
             # 2) 用同一个 IP_INDEX 调 SAP 货物移动 RFC
             sap_send_data = prepare_gm_request(unique_records, ip_index)
             sap_resp = send_gm_request(sap_send_data)
@@ -448,6 +456,17 @@ def get_pending_list(plant_code, year, period):
         "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
         "`special_inventory_status`,`summary_date`"
     )
+    # cond = (
+    #     f" AND `plant_code`='{plant_code}'"
+    #     f" AND `year`='{year}'"
+    #     f" AND `period`='{period}'"
+    #     f" ORDER BY `id` ASC"
+    # )
+    # cols = (
+    #     "`id`,`prodosn`,`summary_line`,`plant_code`,`mat_code`,"
+    #     "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
+    #     "`special_inventory_status`,`summary_date`"
+    # )
     data = query_db_records_by_cond(db, SOURCE_TABLE, cond, cols)
     print("查询待推送半成品扣料记录--", data)
     return data
@@ -519,8 +538,8 @@ def insert_mid_table(records, ip_index):
                 "ERFME": record.get("basic_uom", ""),
                 "CHARG": record.get("batch_sn", ""),
                 "ZUSER": record.get("create_id", ""),
-                "DATUM_B": datum,
-                "UZEIT_B": uzeit,
+                # "DATUM_B": datum,
+                # "UZEIT_B": uzeit,
                 "ZDATE": datum,
                 "ZTIME": uzeit,
                 "BUKRS": BUKRS,
@@ -542,8 +561,9 @@ def insert_mid_table(records, ip_index):
             insert_sql = "insert into {t} ({cols}) values ({v})".format(
                 t=table, cols=",".join(MID_TABLE_COLUMNS), v=",".join(vals))
 
-            print("执行sql命令", insert_sql)
+            # print("执行sql命令", insert_sql)
             n = oracle.execute(insert_sql)
+            print("n-------",n)
             if not n:
                 raise Exception("中间表 {tbl} 写入失败(ip_index={ip}, 第{idx}行)".format(
                     tbl=MID_TABLE, ip=ip_index, idx=idx))
@@ -552,6 +572,35 @@ def insert_mid_table(records, ip_index):
             raise Exception("中间表 {tbl} 写入失败(ip_index={ip})".format(tbl=MID_TABLE, ip=ip_index))
         print("中间表 {tbl} 写入成功(ip_index={ip}, 影响行数={n})".format(tbl=MID_TABLE, ip=ip_index, n=row_count))
         return row_count
+    finally:
+        oracle.close()
+
+
+def query_mid_table_times(ip_index):
+    """INSERT 后回查中间表 ZMES_MM_GOODSREC_MHXT 的开始/结束 日期时间四字段
+
+       DATUM_B/UZEIT_B = 开始日期/时间; DATUM_E/UZEIT_E = 结束日期/时间。
+       用于核对入库后这四个字段的实际取值(秘火写入 / SAP 回写 / 触发器填充)。
+    :return: list[dict], 每行含 DATUM_B/DATUM_E/UZEIT_B/UZEIT_E。
+    """
+    schema = get_schema()
+    table = "{s}.{t}".format(s=schema, t=MID_TABLE) if schema else MID_TABLE
+    sql = (
+        "SELECT DATUM_B, DATUM_E, UZEIT_B, UZEIT_E, ZDATE, ZTIME,UPDATE_DATE, UPDATE_TIME"
+        " FROM {t}"
+        " WHERE IP_INDEX = '{ip}'"
+        " ORDER BY ZCOUNT"
+    ).format(t=table, ip=ip_index)
+    oracle = OracleDB()
+    try:
+        # Oracle 数据库当前时间(便于和时间字段对比时区/写入时刻)
+        now_row = oracle.query(
+            "SELECT TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') AS NOW FROM DUAL"
+        )
+        print("===Oracle 当前时间=== {n}".format(n=now_row))
+        rows = oracle.query(sql)
+        print("===中间表时间字段回查(ip_index={ip})=== {r}".format(ip=ip_index, r=rows))
+        return rows
     finally:
         oracle.close()
 
