@@ -50,13 +50,7 @@ MID_TABLE = "ZMES_MM_GOODSREC_MHXT"            # Oracle 中间表(秘火先 INSE
 PROCESS_FLG_INIT = "5"                    # 秘火写入中间表时的初始状态(SAP 成功置 2 / 失败置 D)
 MANDT = get_cnf("rfc.client")             # SAP 集团号(=RFC client, 生产 801 / 测试 500)
 
-# 中间表 ZMES_MM_GOODSREC_MHXT 列(按接口文档 v1.1)
-# MID_TABLE_COLUMNS = [
-#     "MANDT", "IP_NO", "IP_INDEX", "AUFNR", "ZCOUNT", "BWART", "WERKS", "MATNR",
-#     "ERFMG", "ERFME", "CHARG", "ZUSER", "DATUM_B", "UZEIT_B", "ZDATE", "ZTIME",
-#     "BUKRS", "USRID", "PROCESS_FLG", "LGORT",
-# ]
-
+# 中间表数据
 MID_TABLE_COLUMNS = [
     "MANDT", "IP_NO", "IP_INDEX", "AUFNR", "ZCOUNT", "BWART", "WERKS", "MATNR",
     "ERFMG", "ERFME", "CHARG", "ZUSER", "ZDATE", "ZTIME", "BUKRS", "USRID", "PROCESS_FLG", "LGORT",
@@ -278,7 +272,7 @@ def semiproduct_deduct_push_core(user_id, task_id, year, period, plant_code):
             # 1) 先把扣料明细写入 SAP 中间表 ZMES_MM_GOODSREC_MHXT(PROCESS_FLG=5)
             insert_mid_table(unique_records, ip_index)
             # 1.5) INSERT 后回查开始/结束 时间字段(DATUM_B/DATUM_E/UZEIT_B/UZEIT_E)
-            query_mid_table_times(ip_index)
+            # query_mid_table_times(ip_index)
             # 2) 用同一个 IP_INDEX 调 SAP 货物移动 RFC
             sap_send_data = prepare_gm_request(unique_records, ip_index)
             sap_resp = send_gm_request(sap_send_data)
@@ -456,17 +450,6 @@ def get_pending_list(plant_code, year, period):
         "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
         "`special_inventory_status`,`summary_date`"
     )
-    # cond = (
-    #     f" AND `plant_code`='{plant_code}'"
-    #     f" AND `year`='{year}'"
-    #     f" AND `period`='{period}'"
-    #     f" ORDER BY `id` ASC"
-    # )
-    # cols = (
-    #     "`id`,`prodosn`,`summary_line`,`plant_code`,`mat_code`,"
-    #     "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
-    #     "`special_inventory_status`,`summary_date`"
-    # )
     data = query_db_records_by_cond(db, SOURCE_TABLE, cond, cols)
     print("查询待推送半成品扣料记录--", data)
     return data
@@ -519,9 +502,7 @@ def insert_mid_table(records, ip_index):
     try:
         now = datetime.now()
         datum, uzeit = now.strftime("%Y%m%d"), now.strftime("%H%M%S")
-
-        # 中间表是远程表(经 dblink/网关), INSERT ALL...SELECT 与 DDL 都不被支持(ORA-02021),
-        # 故改为逐行单条 INSERT INTO ... VALUES。
+        # 这里是单条推送 TDD
         row_count = 0
         for idx, record in enumerate(records, start=1):
             row = {
@@ -547,6 +528,7 @@ def insert_mid_table(records, ip_index):
                 "PROCESS_FLG": PROCESS_FLG_INIT,
                 "LGORT": STGE_LOC_DEFAULT,
             }
+            print("ZTIME-----", row["ZTIME"])
             vals = []
             for col in MID_TABLE_COLUMNS:
                 v = row[col]
@@ -554,16 +536,9 @@ def insert_mid_table(records, ip_index):
                     vals.append(str(v))                       # 数值列: 裸数字字面量
                 else:
                     vals.append(repr(str(v)) if v not in (None, "") else "NULL")
-            
-            # owner = oracle.query("SELECT owner FROM all_tables WHERE table_name = 'ZMES_MM_GOODSREC_MHXT'")
-            # print("owner----", owner)
-            print('vals-------',vals)
             insert_sql = "insert into {t} ({cols}) values ({v})".format(
                 t=table, cols=",".join(MID_TABLE_COLUMNS), v=",".join(vals))
-
-            # print("执行sql命令", insert_sql)
             n = oracle.execute(insert_sql)
-            print("n-------",n)
             if not n:
                 raise Exception("中间表 {tbl} 写入失败(ip_index={ip}, 第{idx}行)".format(
                     tbl=MID_TABLE, ip=ip_index, idx=idx))
@@ -578,15 +553,12 @@ def insert_mid_table(records, ip_index):
 
 def query_mid_table_times(ip_index):
     """INSERT 后回查中间表 ZMES_MM_GOODSREC_MHXT 的开始/结束 日期时间四字段
-
-       DATUM_B/UZEIT_B = 开始日期/时间; DATUM_E/UZEIT_E = 结束日期/时间。
-       用于核对入库后这四个字段的实际取值(秘火写入 / SAP 回写 / 触发器填充)。
-    :return: list[dict], 每行含 DATUM_B/DATUM_E/UZEIT_B/UZEIT_E。
+        测试时区的，随时可以删
     """
     schema = get_schema()
     table = "{s}.{t}".format(s=schema, t=MID_TABLE) if schema else MID_TABLE
     sql = (
-        "SELECT DATUM_B, DATUM_E, UZEIT_B, UZEIT_E, ZDATE, ZTIME,UPDATE_DATE, UPDATE_TIME"
+        "SELECT DATUM_B, DATUM_E, UZEIT_B, UZEIT_E, ZDATE, ZTIME"
         " FROM {t}"
         " WHERE IP_INDEX = '{ip}'"
         " ORDER BY ZCOUNT"

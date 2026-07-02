@@ -29,7 +29,6 @@ _FIELD_CODE_MAP = {
     "wyse_certification": "RZZT",       # 认证状态
 }
 
-
 # ==================== 工具 ====================
 def _escape_sql_text(value):
     """转义 SQL 文本里的反斜杠/单引号/双引号"""

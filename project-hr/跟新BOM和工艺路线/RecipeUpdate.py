@@ -214,6 +214,23 @@ def getDropDownList(type, condition, plant_code, work_center, **kwargs):
         return ResponseData(400, f"不支持的类型[{type}]", [])
 
 
+
+
+"""
+根据表t_rgt_routing_operation中字段recipe_code从t_eq_recipe_activity_header找到N条数据，
+如果只找出了一条，就不做处理
+如果找出多条那就走以下逻辑
+
+依次检查找出数据中的work_center如果和t_rgt_routing_operation表中的work_center相同的，则不复制该条数据，
+
+
+如果筛选后的数据recipe_code和work_center与t_rgt_routing_operation表中的数据相同，也不复制这条数据
+
+
+将筛选后的数据存入t_rgt_routing_operation
+
+"""
+
 @ResetResponse(params=["plant_code", "mat_code", "no_update"], excelName="Recipe数据")
 def searchData(plant_code, mat_code, no_update, **kwargs):
     """
@@ -361,87 +378,95 @@ def updateData(type, plant_code, data, **kwargs):
     else:
         return ResponseData(400, "该类型不支持更新", [])
 
-
 def expand_routing_operation_by_work_center(plant_code, data, user_id):
-    """按 recipe_code 在 t_eq_recipe_activity_header 查多条 work_center, 为每个 work_center
-    复制一条 t_rgt_routing_operation(原行不动; 复制行新生成 item_no/operation_number, 其余字段照抄原行)。
+    """按 recipe_code 在 t_eq_recipe_activity_header 命中多个 work_center 时, 为每个新 work_center
+    复制一条 t_rgt_routing_operation: 整行照抄原行, 只把 work_center 换成 header 命中的值;
+    排除原工序本身的 work_center。新行 id 自增, item_no/operation_number 重新生成(唯一索引 IDX_t_rgt_routing_operation_uniqe_number 强制), 其余字段照抄原行。
 
-    仅对 data 里选中的 routing_group 生效, 在 updateRouting 之前调用。
-    只有当某 recipe_code 在 header 命中 >=2 条(多个 work_center)时才展开, 每条 header 复制一行。
+    逻辑:
+      1. 按 routing_group + routing_group_serial_number 在 t_rgt_routing_operation 找工序;
+      2. 拿每条工序的 recipe_code 去 t_eq_recipe_activity_header 找 recipe_code 一致的数据(可能多条);
+      3. 命中的 work_center 与该工序原 work_center 相同则不复制;
+      4. 其余整行复制, 只改 work_center, 存入 t_rgt_routing_operation。
     """
+
+    def _to_int(v):
+        # operation_number 是 varchar, 安全转 int(空/非数字 -> 0); 数据库侧 CAST AS UNSIGNED 会报"无效的数据类型"
+        try:
+            return int(str(v).strip())
+        except (ValueError, TypeError):
+            return 0
+
     db = DbHelper()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     insert_list = []
 
-    op_cols = (
-        "`id`,`plant_code`,`routing_group`,`routing_group_serial_number`,`item_no`,`operation_number`,"
-        "`recipe_id`,`recipe_code`,`sub_recipe_id`,`work_center`,`equipment_id`,"
-        "`operation_qty`,`operation_unit`,`operation_description`,"
-        "`effective_start_date`,`effective_end_date`,`wbs_elements`,`profit_center`"
-    )
-
-    for group in data:
-        routing_group = group.get("routing_group")
-        serial = group.get("routing_group_serial_number")
-        if routing_group is None or serial is None:
+    for item in data:
+        routing_group = item.get("routing_group")
+        routing_group_serial_number = item.get("routing_group_serial_number")
+        if routing_group is None or routing_group_serial_number is None:
             continue
 
-        # 该 routegroup 的工序
+        # 1. 按 routing_group + routing_group_serial_number 找工序(整行取出, 复制时改 work_center + 序号)
         ops = db.query_sql(
-            f"""SELECT {op_cols} FROM `t_rgt_routing_operation`
+            f"""SELECT * FROM `t_rgt_routing_operation`
                 WHERE `plant_code`='{plant_code}'
                   AND `routing_group`='{routing_group}'
-                  AND `routing_group_serial_number`='{serial}'
+                  AND `routing_group_serial_number`='{routing_group_serial_number}'
                 ORDER BY `item_no` ASC """
         )
         if not ops:
             continue
 
-        # 当前最大序号(供复制行生成新 item_no/operation_number, 避免与原行冲突)
-        seq_sql = f"""SELECT COALESCE(MAX(`item_no`),0) AS `max_item_no`,
-                             COALESCE(MAX(`operation_number`),0) AS `max_op_no`
-                      FROM `t_rgt_routing_operation`
-                      WHERE `plant_code`='{plant_code}'
-                        AND `routing_group`='{routing_group}'
-                        AND `routing_group_serial_number`='{serial}' """
-        seq_ret = db.query_sql(seq_sql)
-        max_item_no = seq_ret[0].get("max_item_no") if seq_ret else 0
-        max_op_no = seq_ret[0].get("max_op_no") if seq_ret else 0
+        # 当前最大序号(从已取出的 ops 计算, 复制行生成新 item_no/operation_number, 避免撞唯一索引):
+        # operation_number 是 varchar, 数据库侧 CAST AS UNSIGNED 报"无效的数据类型", 改在 Python 里转 int
+        max_item_no = max((op.get("item_no") or 0) for op in ops)
+        max_op_no = max((_to_int(op.get("operation_number")) for op in ops), default=0)
 
         seq = 0
         for op in ops:
             recipe_code = op.get("recipe_code")
             if not recipe_code:
                 continue
-            # 按 recipe_code 查 header(可能多条 work_center)
+            # 2. 拿工序的 recipe_code 去 header 找一致的数据(可能多条 work_center)
+            # [{'work_center': 'NZ1RC000'}, {'work_center': 'NZ1RC000'}, {'work_center': '99999'}, {'work_center': 'NZ1RC000'}, {'work_center': '99999'}, {'work_center': 'A2355'}]
             headers = db.query_sql(
                 f"""SELECT `work_center` FROM `t_eq_recipe_activity_header`
                     WHERE `recipe_code`='{recipe_code}'
                       AND `plant_code`='{plant_code}'
                       AND `valid_state`='1' """
             )
-            if len(headers) < 2:
-                # 仅在多条 work_center 时展开
-                continue
-            for h in headers:
+            # 3. 先对命中的 work_center 去重(同一 work_center 多条 header 只复制一次), 再逐个处理
+            for h_work_center in dict.fromkeys(h.get("work_center") for h in headers):
+                # work_center 与当前工序相同则不复制该条
+                if h_work_center == op.get("work_center"):
+                    continue
+                # 4. 整行复制: 改 work_center, 重新生成 item_no/operation_number(唯一索引强制); 其余字段照抄原行
                 seq += 1
                 new_op = {**op}
                 new_op.pop("id", None)
-                new_op["work_center"] = h.get("work_center")
+                new_op["work_center"] = h_work_center
                 new_op["item_no"] = max_item_no + seq
                 new_op["operation_number"] = max_op_no + seq
-                new_op["create_id"] = user_id
-                new_op["create_time"] = now
-                new_op["update_id"] = user_id
-                new_op["update_time"] = now
                 insert_list.append(new_op)
 
+    # 按 (recipe_code, work_center) 对 insert_list 去重: 不同工序命中相同 recipe_code 会产生重复组合, 只插一条
+    seen = set()
+    _deduped = []
+    for row in insert_list:
+        key = (row.get("recipe_code"), row.get("work_center"))
+        if key in seen:
+            continue
+        seen.add(key)
+        _deduped.append(row)
+    insert_list = _deduped
+
+    # 将筛选后的数据存入 t_rgt_routing_operation
+    # 注: 该库不支持 INSERT ... ON DUPLICATE KEY UPDATE(报"无法在源表中获得一组稳定的行"),
+    #     故不用 DuplicateSQLKey, 用普通 INSERT。
     if insert_list:
-        db.batchInsertToDB("t_rgt_routing_operation", insert_list, printSql=True)
+        db.batchInsertToDB("t_rgt_routing_operation", insert_list, user_id=user_id, printSql=True)
         db.updateDBObj()
-        logger.printInfo("expand_routing_operation_by_work_center 新增工序行数", len(insert_list))
-
-
+        print(f"expand_routing_operation_by_work_center 新增工序行数: {len(insert_list)}")
 
 
 
