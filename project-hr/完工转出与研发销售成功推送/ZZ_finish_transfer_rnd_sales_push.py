@@ -20,11 +20,22 @@
        SAP生成财务凭证后回写 external_sn, 刷新界面。
 """
 
+import json
 from datetime import datetime
 
 from DbHelper import DbHelper
+from libenhance import Request, Response
 from logger import LoggerConfig, LogLevel
-from ToolsMethods import ResetResponse, ResponseData
+from ToolsMethods import (
+    GetExportData,
+    Paginator,
+    ResetResponse,
+    ResponseData,
+    calc_time,
+    create_table_alias,
+    display_to_entozh,
+    generate_raw_sql,
+)
 from utils import ItfBizError, update_db_record_by_cond
 from ZZEXT_SendRequest import SendToSap
 
@@ -116,23 +127,76 @@ def _validate_params(company_code, year, period, document_category):
 
 
 # ==================== 查询接口 ====================
-@ResetResponse(params=["company_code", "year", "period", "document_category"], excelName='完工转出与研发销售成功', pagination=True)
-def finish_transfer_rnd_sales_query(company_code, year, period, document_category, **kwargs):
+def finish_transfer_rnd_sales_query():
     """完工转出与研发销售成功 查询接口
 
     前端两个 sheet(研发完工转出 RACT / 销售研发成本 RACD)共用本接口,
+    _payload_.export_excel 为真时导出 Excel, 否则分页返回。
     """
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
     print("===完工转出与研发销售成功 查询接口===")
+
+    data = body.get("data") or {}
+    company_code = data.get("company_code")
+    year = data.get("year")
+    period = data.get("period")
+    document_category = data.get("document_category")
+
     # 入参校验, 失败带 type=E 返回前端
     ok, msg = _validate_params(company_code, year, period, document_category)
     if not ok:
-        return ResponseData(500, msg, [], display=DISPLAY, type="E")
+        response = {"code": 500, "type": "E", "msg": msg}
+        print(f"===完工转出与研发销售成功 查询接口=== 参数校验失败: {msg}")
+        res.set_body(json.dumps(response))
+        res.commit(True)
+        return
 
-    code, msg, data, _ = finish_transfer_rnd_sales_query_core(company_code, year, period, document_category)
-    # 查询为空 -> 带 type=E 返回前端
-    if not data:
-        return ResponseData(200, msg or "未查询到数据", [], display=DISPLAY, type="E")
-    return ResponseData(code, msg, data, display=DISPLAY, type="S")
+    payload = body.get("_payload_", {})
+    filter_info = payload.get("filter_info", {})
+    sort_info = payload.get("sort_info", {})
+    export_excel = payload.get("export_excel")
+
+    code, msg, query_data, display = finish_transfer_rnd_sales_query_core(
+        company_code, year, period, document_category)
+    if code != 200:
+        res.set_body(json.dumps({"code": code, "type": "E", "msg": msg}))
+        res.commit(True)
+        return
+
+    if export_excel:
+        stamp_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+        excel_filename = f"完工转出与研发销售成功-{stamp_suffix}.xlsx"
+        format_data = [{"sheet1": query_data}]
+        field_dict = display_to_entozh(display)
+        GetExportData(format_data, excel_filename, field_dict)
+    else:
+        page_size = payload.get("page", {}).get("page_size", 0)
+        page_num = payload.get("page", {}).get("page_num", 1)
+        paginator = Paginator(query_data, page_size)
+        page_items = paginator.get_page(page_num)
+        total_pages = paginator.total_pages
+        data_sum = len(query_data)
+
+        response = {
+            "code": 200,
+            "msg": "成功",
+            "data": page_items,
+            "page": {
+                "page_size": page_size if page_size else len(query_data),  # 每页数据行数
+                "page_num": page_num,  # 当前页
+                "page_sum": total_pages,  # 总页数
+                "data_sum": data_sum,  # 总数据行数
+            },
+            "rule": {
+                "sort_info": sort_info,
+                "filter_info": filter_info,
+            },
+            "display": display,
+        }
+        res.set_body(json.dumps(response))
+        res.commit(True)
 
 
 def finish_transfer_rnd_sales_query_core(company_code, year, period,

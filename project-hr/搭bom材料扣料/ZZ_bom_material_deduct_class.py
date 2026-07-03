@@ -1,5 +1,23 @@
 # -*- coding: UTF-8 -*-
 
+"""
+@File    : ZZ_bom_material_deduct_class.py
+@Author  : yang.zhang@dxdstech.com
+@Date    : 2026/07/01
+@explain : 搭BOM材料扣料
+
+调用方向:   秘火->SAP
+模块名称:   搭BOM材料扣料(成本中心领用)
+接口名称:   搭BOM材料扣料接口
+接口说明：  搭BOM材料扣料, 调 SAP 货物移动 RFC(ZRFC_MM_GNRTRANS_RACQ, MB1A),
+            移动类型 201/Y01(正向领用)/202/Y02(反向冲销),
+            并将物料凭证号/年度/状态/消息回写至 t_co_summary_result。
+源表:       t_co_summary_report(扣料明细)
+结果表:     t_co_summary_result(过账结果)
+中间表:     ZMES_MM_GNRTRANS_MHXT (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
+"""
+
+
 import json
 import traceback
 from datetime import datetime
@@ -23,18 +41,9 @@ from ZZEXT_SapRFC import SAPRFC
 usprint = LoggerConfig()
 
 
+
 class BomMaterialDeduct:
-    """
-    调用方向:   秘火->SAP
-    模块名称:   搭BOM材料扣料(成本中心领用)
-    接口名称:   搭BOM材料扣料接口
-    接口说明：  搭BOM材料扣料, 调 SAP 货物移动 RFC(ZRFC_MM_GNRTRANS_RACQ, MB1A),
-                移动类型 201/Y01(正向领用)/202/Y02(反向冲销),
-                并将物料凭证号/年度/状态/消息回写至 t_co_summary_result。
-    源表:       t_co_summary_report(扣料明细)
-    结果表:     t_co_summary_result(过账结果)
-    中间表:     ZMES_MM_GNRTRANS_MHXT (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
-    """
+
 
     # ---------- 固定值(按接口文档 v1.1, 集中维护) ----------
     # SAP接口编码 / RFC函数名
@@ -52,7 +61,7 @@ class BomMaterialDeduct:
         "MANDT", "IP_NO", "IP_INDEX", "ZCOUNT", "MATNR", "WERKS", "BWART",
         "INSMK", "ERFMG", "ERFME", "S_LGORT", "S_CHARG",
         "ZDATE", "ZTIME", "BUKRS", "USRID", "PROCESS_FLG",
-        "ZTEXT3", "SAKTO", "BUDAT",
+        "ZTEXT3", "BUDAT",
     ]
 
     # BAPI 货物移动事务代码 / 公司代码 / 工厂
@@ -80,7 +89,7 @@ class BomMaterialDeduct:
         self.db = DbHelper()
 
     # ==================== 公共入口(按钮) ====================
-    def push(self, body, user_id=0):
+    def push(self, body):
         """搭BOM材料扣料接口: 传入 body, 返回 {code,msg,data,display}。
 
         :param body: 请求体(dict; 传 JSON 字串会自动 json.loads)。
@@ -91,21 +100,25 @@ class BomMaterialDeduct:
         print("===搭BOM材料扣料接口===")
         if isinstance(body, str):
             body = json.loads(body)
-
-        payload = body.get("data") or {}
-        task_id = payload.get("task_id") or 604
-
+        payload = body
         # 公共参数校验, 失败直接返回
         ok, msg, params = self._validate_deduct_params(payload)
         if not ok:
             print(f"===搭BOM材料扣料接口=== 参数校验失败: {msg}")
             return {"code": 500, "msg": msg, "data": None}
 
-        res_bus = self._push_core(
-            user_id, task_id, params["year"], params["period"], params["plant_code"]
-        )
+        # body 为扁平结构, summary_unique_number/summary_type 指定本次推送的汇总单
+        # (缺省时退化为按 plant/year/period 推全部待推)
+        summary_unique_number = payload.get("summary_unique_number") or ""
+        summary_type = payload.get("summary_type")
+
+        res_bus = self._push_core(params["year"], params["period"], params["plant_code"],
+                                  summary_unique_number=summary_unique_number,
+                                  summary_type=summary_type)
         print(f"===搭BOM材料扣料接口=== 处理结束!!! 返回: {res_bus}")
         return res_bus
+
+
 
     def query(self, body):
         """搭BOM材料扣料查询接口: 传入 body, 返回 {code,msg,data,page,rule,display}。
@@ -118,7 +131,6 @@ class BomMaterialDeduct:
         print("===搭BOM材料扣料查询接口===")
         if isinstance(body, str):
             body = json.loads(body)
-        print("body----", body)
 
         # 公共参数校验(plant_code/year/period), 失败直接返回
         ok, msg, _ = self._validate_deduct_params(body.get("data") or {})
@@ -206,17 +218,18 @@ class BomMaterialDeduct:
         return True, "校验通过", params
 
     # ==================== 推送核心 ====================
-    def _push_core(self, user_id, task_id, year, period, plant_code):
+    def _push_core(self, year, period, plant_code, summary_unique_number="", summary_type=None):
         """搭BOM材料扣料 核心逻辑(605 core)
         查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态。
+
+        :param summary_unique_number: 指定推送某张汇总单; 空则按 plant/year/period 推全部待推。
+        :param summary_type: 配套的汇总类型(与 summary_unique_number 组成唯一键)。
         :return: {"code", "msg", "data", "display"}
         """
         code, msg = 200, "无可推送记录"
         body = {"data": {"year": year, "period": period, "plant_code": plant_code}}
-        print(f"===搭BOM材料扣料 core=== user_id={user_id} task_id={task_id} "
-              f"plant_code={plant_code} {year}-{period}")
         # 查询待推送记录
-        records = self._get_pending_list(plant_code, year, period)
+        records = self._get_pending_list(plant_code, year, period, summary_unique_number, summary_type)
         print("待推送记录--", records)
         # 按 id 去重
         push_dict = {}
@@ -240,7 +253,7 @@ class BomMaterialDeduct:
                 sap_resp = self._send_gm_request(sap_send_data)
                 resp = self._extract_gm_response(sap_resp)
                 stat = str(resp.get("stat"))
-                # 整批共用一个物料凭证号, 逐条回写
+                # 整批共用一个物料凭证号, 回写结果表 + 源表(成功存3/失败存2)
                 self._update_summary_result(unique_records, resp)
                 if stat == "2":
                     code, msg = 200, f"推送成功 {record_cnt} 条"
@@ -255,11 +268,11 @@ class BomMaterialDeduct:
                 # 异常时把整批置为失败
                 fail_resp = {"mat_doc": "", "doc_year": "", "msg": str(e), "stat": "D"}
                 self._update_summary_result(unique_records, fail_resp)
-
         # 回查最终状态(供前端刷新表格)
         data, display = self._query_data(body)
-
         return {"code": code, "msg": msg, "data": data, "display": display}
+
+
 
     # ==================== 查询 ====================
     def _query_data(self, body):
@@ -334,20 +347,25 @@ class BomMaterialDeduct:
         return query_data, display
 
     # ==================== SAP 货物移动 组装/发送/解析/回写 ====================
-    def _get_pending_list(self, plant_code, year, period):
+    def _get_pending_list(self, plant_code, year, period, summary_unique_number="", summary_type=None):
         """查询待推送的搭BOM材料扣料记录
-                  目前按 t_co_summary_report 的 plant/year/period + 移动类型 201/202/Y01/Y02 取,
-                  并以结果表 status != '2' 作为待推送。
+                  按 t_co_summary_report 的 plant/year/period 取(不再按 movement_type 过滤;
+                  movement_type 随 body 传, 仅推送 SAP 时用), 并以 posting_status != '3' 作为待推送
+                  (成功存3, 不再重复推; 失败存2仍可重推)。
+                  若传 summary_unique_number(可配 summary_type) 则只取该汇总单的明细。
         :return: list[dict]
         """
-        move_types = ", ".join(f"'{m}'" for m in self.MOVE_TYPE_ALL)
         cond = (
             f" AND `plant_code`='{plant_code}'"
             f" AND `year`='{year}'"
             f" AND `period`='{period}'"
-            f" AND `movement_type` IN ({move_types})"
-            f" ORDER BY `id` ASC"
+            f" AND `posting_status`!='3'"
         )
+        if summary_unique_number:
+            cond += f" AND `summary_unique_number`='{summary_unique_number}'"
+        if summary_type not in (None, ""):
+            cond += f" AND `summary_type`='{summary_type}'"
+        cond += " ORDER BY `id` ASC"
         cols = (
             "`id`,`summary_line`,`movement_type`,`plant_code`,`mat_code`,"
             "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
@@ -392,7 +410,7 @@ class BomMaterialDeduct:
         :return: 受影响行数; 写入失败抛异常。
         """
         schema = get_schema()
-        # 远程中间表引用方式(按实际报错切换):
+        # 远程中间表引用方式
         #   1) schema 前缀:     table = "{s}.{t}".format(s=schema, t=MID_TABLE)   ← 当前
         #   2) 裸名(走同义词):  table = MID_TABLE
         #   3) dblink:          table = "{t}@{s}".format(t=MID_TABLE, s=schema)
@@ -426,7 +444,7 @@ class BomMaterialDeduct:
                     "USRID": self.USRID,
                     "PROCESS_FLG": self.PROCESS_FLG_INIT,
                     "ZTEXT3": record.get("cost_center", ""),                           # 成本中心(必填)
-                    "SAKTO": record.get("cost_element", ""),                           # 总账科目/成本要素
+                    # "SAKTO": record.get("cost_element", ""),                           # 总账科目/成本要素
                     "BUDAT": self._to_ymd(record.get("summary_date")) or datum,         # 过账日期(汇总日期)
                 }
 
@@ -474,7 +492,7 @@ class BomMaterialDeduct:
             "BATCH": str(record.get("batch_sn", "") or ""),           # 批次
             "MOVE_TYPE": move_type,                                    # 移动类型 201/202/Y01/Y02
             "STCK_TYPE": str(record.get("special_inventory_status", "") or ""),  # 库存类型
-            "MOVE_REAS": "",                                           # 移动原因(空)
+            # "MOVE_REAS": "",                                           # 移动原因(空)
             "ENTRY_QNT": self._parse_amount(record.get("consump_qty")),    # 数量
             "ENTRY_UOM": str(record.get("basic_uom", "") or ""),      # 单位
             "COSTCENTER": str(record.get("cost_center", "") or ""),   # 成本中心
@@ -524,31 +542,51 @@ class BomMaterialDeduct:
         }
 
     def _update_summary_result(self, records, resp):
-        """回写 t_co_summary_result: 物料凭证号/年度/状态/消息
-        result 表的关联键与字段以实际表结构为准,
-                  目前按 summary_line 更新(搭BOM 无订单号), 字段用文档映射。
+        """回写结果表 + 源表: 物料凭证号/年度/状态/消息
+
+        状态映射(新逻辑): SAP 成功(stat='2') -> 表里存 3; 失败(stat='D'等) -> 表里存 2。
+        两张表共用同一映射(由 _map_posting_status 统一换算):
+          t_co_summary_result.status         (按 summary_line 逐条更新)
+          t_co_summary_report.posting_status (按 id 批量更新)
+
+        本函数在 成功响应 / 失败响应 / 异常 三个路径都被调用, 故源表也会随之更新,
+        无需在调用方再单独处理。
         """
         if not records:
             return
         mat_doc = resp.get("mat_doc", "")
         doc_year = resp.get("doc_year", "")
         stat = resp.get("stat", "D")
+        store_status = self._map_posting_status(stat)   # 成功->3 / 失败->2
         msg = (resp.get("msg", "") or "")[:65535]
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # 源表 t_co_summary_report: 按主键 id 批量更新过账状态(成功3 / 失败2)
+        ids = [str(r.get("id")) for r in records if r.get("id") is not None and str(r.get("id")) != ""]
+        if ids:
+            src_cond = " AND `id` IN ({})".format(",".join(ids))
+            update_db_record_by_cond(self.db, self.SOURCE_TABLE, src_cond, ("posting_status",),
+                                     {"posting_status": store_status})
+
+        # 结果表 t_co_summary_result: 按 summary_line 逐条更新
         for record in records:
             summary_line = record.get("summary_line", "")
             cond = f" AND `summary_line`='{summary_line}'"
             data = {
                 "associated_doc_sn": mat_doc,
                 "year": doc_year,
-                "status": stat,
+                "status": store_status,
                 "post_account_msg": msg,
                 "update_time": now_str,
             }
             cols = ("associated_doc_sn", "year", "status", "post_account_msg", "update_time")
             update_db_record_by_cond(self.db, self.RESULT_TABLE, cond, cols, data)
         self.db.dbCommit()
+
+    @staticmethod
+    def _map_posting_status(stat):
+        """SAP 返回状态 -> 表里存的过账状态: 成功('2') 存 3, 失败('D'/其它) 存 2"""
+        return "3" if str(stat) == "2" else "2"
 
     # ==================== 工具 ====================
     @staticmethod
@@ -573,61 +611,44 @@ class BomMaterialDeduct:
             return ""
 
 
-# ====================================================================================
-#  对外入口(框架按钮调这两个函数; 语义/签名/装饰器与原文件完全一致)
-# ====================================================================================
 @calc_time
-def bom_material_deduct_push(body, user_id):
+def bom_material_deduct_push(body):
     """搭BOM材料扣料接口 按钮(框架 HTTP 入口)
     其他文件可直接 BomMaterialDeduct().push(body) 拿 {code,msg,data,..}。
     """
-    # req = Request()
-    # res = Response()
-    # body = json.loads(req.body())
-    # user_id = req.header("user_id")
-    result = BomMaterialDeduct().push(body, user_id=user_id)
-    # res.set_body(json.dumps(result))
-    # res.commit(True)
-    return result["code"], result["msg"], result["data"]
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
+    result = BomMaterialDeduct().push(body)
+    res.set_body(json.dumps(result))
+    res.commit(True)
+
 
 @calc_time
-def bom_material_deduct_query(body, user_id):
+def bom_material_deduct_query(body):
     """搭BOM材料扣料查询接口(框架 HTTP 入口)"""
-    # req = Request()
-    # res = Response()
-    # body = json.loads(req.body())
-    result = BomMaterialDeduct().query(body, user_id=user_id)
-    # if result is not None:   # export_excel 时 query 已直接触发文件下载, 不再写 JSON
-    #     res.set_body(json.dumps(result))
-    #     res.commit(True)
-    return result["code"], result["msg"], result["data"]
+    req = Request()
+    res = Response()
+    body = json.loads(req.body())
+    result = BomMaterialDeduct().query(body)
+    res.set_body(json.dumps(result))
+    res.commit(True)
 
 
 
 
-# ====================================================================================
-#  Test
-# ====================================================================================
-Text_bom_material_deduct_push_payload = {
-    "_payload_": {
-        "sort_info": [],
-        "filter_info": {},
-        "group_info": [],
-        "statistic_info": [],
-        "page": {"page_size": 0, "page_num": 1},
-        "export_excel": "false"
-    },
-    "data": {
-        "plant_code": "RAC1",
-        "year": "2026",
-        "period": "06",
-        "task_id": 605
-    }
-}
+body = {'summary_unique_number': '00f2f6c87dc03297f36ce2e201d95947','summary_type': 11, 'plant_code': 'RAC1', 'period': '07', 'path': '', 'year': '2026'}
+
+
+
+@calc_time
+def Text_bom_material_deduct_push():
+    """搭BOM材料扣料推送接口 测试(直接走 class 入口, body 为模块级扁平字典)"""
+    print("===搭BOM材料扣料推送接口 测试===")
+    res_bus = BomMaterialDeduct().push(body)
+    print(f"===搭BOM材料扣料推送接口 测试=== 处理结束!!! 返回: {res_bus}")
+    return res_bus
 
 
 if __name__ == "__main__":
-    # 本地联调: 直接调 push(body)(绕开 Request/Response), 返回 {code,msg,data,..}
-    inst = BomMaterialDeduct()
-    result = inst.push(Text_bom_material_deduct_push_payload, user_id="testuser")
-    print(f"===搭BOM材料扣料推送接口=== 处理结束!!! 返回: {result}")
+    Text_bom_material_deduct_push()

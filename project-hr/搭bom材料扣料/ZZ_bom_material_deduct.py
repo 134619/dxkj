@@ -14,6 +14,23 @@
   结果表:     t_co_summary_result(过账结果)
   中间表:     ZMES_MM_GNRTRANS_MHXT (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
 """
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
+
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
+
+
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
 import json
 import traceback
 from datetime import datetime
@@ -48,16 +65,24 @@ PROCESS_FLG_INIT = "5"                    # 秘火写入中间表时的初始状
 MANDT = get_cnf("rfc.client")             # SAP 集团号(=RFC client, 生产 801 / 测试 500)
 
 # 中间表 ZMES_MM_GNRTRANS_MHXT 列(按接口文档 v1.1, 成本中心领用: 无 AUFNR, 含 INSMK/SAKTO/ZTEXT3/BUDAT)
+# MID_TABLE_COLUMNS = [
+#     "MANDT", "IP_NO", "IP_INDEX", "ZCOUNT", "MATNR", "WERKS", "BWART",
+#     "INSMK", "ERFMG", "ERFME", "S_LGORT", "S_CHARG",
+#     "ZDATE", "ZTIME", "BUKRS", "USRID", "PROCESS_FLG",
+#     "ZTEXT3", "SAKTO", "BUDAT",
+# ]
+
 MID_TABLE_COLUMNS = [
     "MANDT", "IP_NO", "IP_INDEX", "ZCOUNT", "MATNR", "WERKS", "BWART",
     "INSMK", "ERFMG", "ERFME", "S_LGORT", "S_CHARG",
     "ZDATE", "ZTIME", "BUKRS", "USRID", "PROCESS_FLG",
-    "ZTEXT3", "SAKTO", "BUDAT",
+    "ZTEXT3", "BUDAT",
 ]
 
+
 # BAPI 货物移动事务代码 / 公司代码 / 工厂
-# GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
-GM_CODE = "11"                      # 在润工作上沟通过，
+GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
+# GM_CODE = "11"                      # 在润工作上沟通过，
 BUKRS = "RACQ"                      # P_BUKRS 固定 RACQ
 PLANT_DEFAULT = "RAC1"              # 工厂(文档固定值 RAC1)
 USRID = "MH"                        # 用户名(文档固定 MH)
@@ -210,10 +235,8 @@ def bom_material_deduct_push():
     res = Response()
     body = json.loads(req.body())
     print("body---", body)
-    user_id = req.header("user_id")
 
     payload = body.get("data") or {}
-    task_id = payload.get("task_id") or 604
 
     # 公共参数校验, 失败直接返回
     ok, msg, params = validate_deduct_params(payload)
@@ -223,24 +246,23 @@ def bom_material_deduct_push():
         res.set_body(json.dumps(response))
         res.commit(True)
         return
-
-    res_bus = bom_material_deduct_push_core(
-        user_id, task_id, params["year"], params["period"], params["plant_code"]
+    res_bus = bom_material_deduct_push_core(params["year"], params["period"], params["plant_code"]
     )
     print(f"===搭BOM材料扣料接口=== 处理结束!!! 返回: {res_bus}")
     res.set_body(json.dumps(res_bus))
     res.commit(True)
 
+
+
 @calc_time
-def bom_material_deduct_push_core(user_id, task_id, year, period, plant_code):
+def bom_material_deduct_push_core(year, period, plant_code):
     """搭BOM材料扣料 核心逻辑(605 core)
     查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态。
     :return: {"code", "msg", "data", "display"}
     """
     code, msg = 200, "无可推送记录"
     body = {"data": {"year": year, "period": period, "plant_code": plant_code}}
-    print(f"===搭BOM材料扣料 core=== user_id={user_id} task_id={task_id} "
-          f"plant_code={plant_code} {year}-{period}")
+
     # 查询待推送记录
     records = get_pending_list(plant_code, year, period)
     print("待推送记录--", records)
@@ -266,7 +288,7 @@ def bom_material_deduct_push_core(user_id, task_id, year, period, plant_code):
             sap_resp = send_gm_request(sap_send_data)
             resp = extract_gm_response(sap_resp)
             stat = str(resp.get("stat"))
-            # 整批共用一个物料凭证号, 逐条回写
+            # 整批共用一个物料凭证号, 回写结果表 + 源表(成功存3/失败存2)
             update_summary_result(unique_records, resp)
             if stat == "2":
                 code, msg = 200, f"推送成功 {record_cnt} 条"
@@ -424,7 +446,7 @@ def bom_material_deduct_query_data(body):
 def get_pending_list(plant_code, year, period):
     """查询待推送的搭BOM材料扣料记录
               目前按 t_co_summary_report 的 plant/year/period + 移动类型 201/202/Y01/Y02 取,
-              并以结果表 status != '2' 作为待推送。
+              并以 posting_status != '3' 作为待推送(成功存3, 不再重复推; 失败存2仍可重推)。
     :return: list[dict]
     """
     move_types = ", ".join(f"'{m}'" for m in MOVE_TYPE_ALL)
@@ -433,6 +455,7 @@ def get_pending_list(plant_code, year, period):
         f" AND `year`='{year}'"
         f" AND `period`='{period}'"
         f" AND `movement_type` IN ({move_types})"
+        f" AND `posting_status`!='3'"
         f" ORDER BY `id` ASC"
     )
     cols = (
@@ -515,10 +538,10 @@ def insert_mid_table(records, ip_index):
                 "USRID": USRID,
                 "PROCESS_FLG": PROCESS_FLG_INIT,
                 "ZTEXT3": record.get("cost_center", ""),                           # 成本中心(必填)
-                "SAKTO": record.get("cost_element", ""),                           # 总账科目/成本要素
-                "BUDAT": _to_ymd(record.get("summary_date")) or datum,              # 过账日期(汇总日期)
+                # "SAKTO": record.get("cost_element", ""),                           # 总账科目/成本要素
+                "BUDAT": _to_ymd(record.get("summary_date")),              # 过账日期(汇总日期)
             }
-            
+            print("cost_element-----",record.get("cost_element"))
             vals = []
             for col in MID_TABLE_COLUMNS:
                 v = row[col]
@@ -564,7 +587,7 @@ def build_gm_item(record, idx):
         "BATCH": str(record.get("batch_sn", "") or ""),           # 批次
         "MOVE_TYPE": move_type,                                    # 移动类型 201/202/Y01/Y02
         "STCK_TYPE": str(record.get("special_inventory_status", "") or ""),  # 库存类型
-        "MOVE_REAS": "",                                           # 移动原因(空)
+        # "MOVE_REAS": "",                                           # 移动原因(空)
         "ENTRY_QNT": _parse_amount(record.get("consump_qty")),    # 数量
         "ENTRY_UOM": str(record.get("basic_uom", "") or ""),      # 单位
         "COSTCENTER": str(record.get("cost_center", "") or ""),   # 成本中心
@@ -617,31 +640,53 @@ def extract_gm_response(sap_resp):
 
 
 def update_summary_result(records, resp):
-    """回写 t_co_summary_result: 物料凭证号/年度/状态/消息
-    result 表的关联键与字段以实际表结构为准,
-              目前按 summary_line 更新(搭BOM 无订单号), 字段用文档映射。
+    """回写结果表 + 源表: 物料凭证号/年度/状态/消息
+
+    状态映射(新逻辑): SAP 成功(stat='2') -> 表里存 3; 失败(stat='D'等) -> 表里存 2。
+    两张表共用同一映射(由 _map_posting_status 统一换算):
+      t_co_summary_result.status         (按 summary_line 逐条更新)
+      t_co_summary_report.posting_status (按 id 批量更新)
+
+    本函数在 成功响应 / 失败响应 / 异常 三个路径都被调用, 故源表也会随之更新,
+    无需在调用方再单独处理。
     """
     if not records:
         return
+    print("resp----",resp)
     mat_doc = resp.get("mat_doc", "")
     doc_year = resp.get("doc_year", "")
     stat = resp.get("stat", "D")
+    store_status = _map_posting_status(stat)   # 成功->3 / 失败->2
     msg = (resp.get("msg", "") or "")[:65535]
+    print(mat_doc, msg)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 源表 t_co_summary_report: 按主键 id 批量更新过账状态(成功3 / 失败2)
+    ids = [str(r.get("id")) for r in records if r.get("id") is not None and str(r.get("id")) != ""]
+    if ids:
+        src_cond = " AND `id` IN ({})".format(",".join(ids))
+        update_db_record_by_cond(db, SOURCE_TABLE, src_cond, ("posting_status",),
+                                 {"posting_status": store_status})
+
+    # 结果表 t_co_summary_result: 按 summary_line 逐条更新
     for record in records:
         summary_line = record.get("summary_line", "")
         cond = f" AND `summary_line`='{summary_line}'"
         data = {
             "associated_doc_sn": mat_doc,
             "year": doc_year,
-            "status": stat,
+            "status": store_status,
             "post_account_msg": msg,
             "update_time": now_str,
         }
         cols = ("associated_doc_sn", "year", "status", "post_account_msg", "update_time")
         update_db_record_by_cond(db, RESULT_TABLE, cond, cols, data)
     db.dbCommit()
+
+
+def _map_posting_status(stat):
+    """SAP 返回状态 -> 表里存的过账状态: 成功('2') 存 3, 失败('D'/其它) 存 2"""
+    return "3" if str(stat) == "2" else "2"
 
 
 # ---------- 工具 ----------
@@ -666,24 +711,8 @@ def _to_ymd(date_value):
         return ""
 
 
+body = {'summary_unique_number': '00f2f6c87dc03297f36ce2e201d95947','summary_type': 11, 'plant_code': 'RAC1', 'period': '07', 'path': '', 'year': '2026'}
 
-# ==================== Test ====================
-Text_bom_material_deduct_push_payload = {
-    "_payload_": {
-        "sort_info": [],
-        "filter_info": {},
-        "group_info": [],
-        "statistic_info": [],
-        "page": {"page_size": 0, "page_num": 1},
-        "export_excel": "false"
-    },
-    "data": {
-        "plant_code": "RAC1",
-        "year": "2026",
-        "period": "06",
-        "task_id": 605
-    }
-}
 
 
 @calc_time
@@ -692,17 +721,13 @@ def Text_bom_material_deduct_push():
     task_id 604
     """
     print("===搭BOM材料扣料推送接口===")
-    user_id = 'testuser'
-    payload = Text_bom_material_deduct_push_payload.get("data") or {}
-    task_id = payload.get("task_id") or 604
-
+    payload = body
     # 公共参数校验, 失败直接返回
     ok, msg, params = validate_deduct_params(payload)
     if not ok:
         print(f"===搭BOM材料扣料推送接口=== 参数校验失败: {msg}")
         return
-    res_bus = bom_material_deduct_push_core(
-        user_id, task_id, params["year"], params["period"], params["plant_code"]
+    res_bus = bom_material_deduct_push_core(params["year"], params["period"], params["plant_code"]
     )
     print(f"===搭BOM材料扣料推送接口=== 处理结束!!! 返回: {res_bus}")
     return res_bus

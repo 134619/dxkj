@@ -17,6 +17,25 @@
   中间表:     ZMES_MM_GOODSREC_MHXT (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
 
 """
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
+
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
+
+
+
+# TODO: 该文件内容暂时不用，使用 ZZ_semiproduct_deduct_push_class.py
+
+
 import json
 import traceback
 from datetime import datetime
