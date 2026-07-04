@@ -18,13 +18,10 @@
 中间表:     ZMES_MM_GOODSREC_MHXT (Oracle, 秘火先 INSERT PROCESS_FLG=5, 再调 RFC)
 """
 
-
-
 import json
 import traceback
 from datetime import datetime
 
-import pyrfc
 from DbHelper import DbHelper
 from libenhance import Request, Response, get_cnf
 from logger import LoggerConfig
@@ -63,7 +60,7 @@ class SemiproductDeductPush:
     ]
 
     # BAPI 货物移动事务代码 / 公司代码 / 工厂 / 存储地点
-    GM_CODE = "11"                      # P_CODE.GM_CODE 固定值 03(MB1A)
+    GM_CODE = "11"                      # P_CODE.GM_CODE 固定值(MB1A)
     BUKRS = "RACQ"                      # P_BUKRS 固定 RACQ
     PLANT_DEFAULT = "RAC1"              # 工厂(文档固定值 RAC1)
     STGE_LOC_DEFAULT = "0050"           # 存储地点(文档固定值 0050)
@@ -83,6 +80,7 @@ class SemiproductDeductPush:
 
     def __init__(self):
         self.db = DbHelper()
+        self.movement_type = ""   # 本次推送移动类型(_push_core 赋值, _insert_mid_table/_build_gm_item 读取)
 
     # ==================== 公共入口(按钮) ====================
     def push(self, body):
@@ -109,10 +107,12 @@ class SemiproductDeductPush:
         # (缺省时退化为按 plant/year/period 推全部待推)
         summary_unique_number = payload.get("summary_unique_number") or ""
         summary_type = payload.get("summary_type")
+        movement_type = payload.get("movement_type")
 
         res_bus = self._push_core(
             "0", task_id, params["year"], params["period"], params["plant_code"],
             summary_unique_number=summary_unique_number, summary_type=summary_type,
+            movement_type=movement_type,
         )
         print(f"===半成品扣料推送接口=== 处理结束!!! 返回: {res_bus}")
         return res_bus
@@ -216,22 +216,24 @@ class SemiproductDeductPush:
 
     # ==================== 推送核心 ====================
     def _push_core(self, user_id, task_id, year, period, plant_code,
-                   summary_unique_number="", summary_type=None):
+                   summary_unique_number="", summary_type=None, movement_type=None):
         """半成品扣料推送 核心逻辑(604 core)
         查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态
 
         :param summary_unique_number: 指定推送某张汇总单; 空则按 plant/year/period 推全部待推。
         :param summary_type: 配套的汇总类型(与 summary_unique_number 组成唯一键)。
+        :param movement_type: 移动类型(261正向发料/262反向冲销), 决定本次可推送的过账状态。
         :return: {"code", "msg", "data", "display"}
         """
-        code, msg = 200, "无可推送记录"
+        code, msg = 500, "无可推送记录"
         body = {"data": {"year": year, "period": period, "plant_code": plant_code}}
         print(f"===半成品扣料推送 core=== user_id={user_id} task_id={task_id} "
               f"plant_code={plant_code} {year}-{period}")
+        # 本次推送的移动类型(来自请求, 整批共用), 供 _insert_mid_table / _build_gm_item 传 SAP
+        self.movement_type = str(movement_type or "").strip()
 
         # 查询待推送记录
-        records = self._get_pending_list(plant_code, year, period, summary_unique_number, summary_type)
-        print("待推送记录--", records)
+        records = self._get_pending_list(plant_code, year, period, summary_unique_number, summary_type, movement_type)
         # 按 id 去重
         push_dict = {}
         unique_records = []
@@ -242,8 +244,6 @@ class SemiproductDeductPush:
                 unique_records.append(record)
         # 正向(261)必须先于反向(262)传送, 同向按 id(创建先后)升序
         unique_records.sort(key=lambda r: (str(r.get("movement_type")) == self.MOVE_TYPE_NEG, r.get("id") or 0))
-
-        print("去重后记录--", unique_records)
         record_cnt = len(unique_records)
         # ===== 一次性全推送: 先 INSERT Oracle 中间表, 再一次调 RFC =====
         if record_cnt:
@@ -251,28 +251,26 @@ class SemiproductDeductPush:
             try:
                 # 1) 先把扣料明细写入 SAP 中间表 ZMES_MM_GOODSREC_MHXT(PROCESS_FLG=5)
                 self._insert_mid_table(unique_records, ip_index)
-                # 1.5) INSERT 后回查开始/结束 时间字段(DATUM_B/DATUM_E/UZEIT_B/UZEIT_E)
-                # self._query_mid_table_times(ip_index)
                 # 2) 用同一个 IP_INDEX 调 SAP 货物移动 RFC
                 sap_send_data = self._prepare_gm_request(unique_records, ip_index)
                 sap_resp = self._send_gm_request(sap_send_data)
                 resp = self._extract_gm_response(sap_resp)
                 stat = str(resp.get("stat"))
                 # 整批共用一个物料凭证号, 回写结果表 + 源表(成功存3/失败存2)
-                self._update_summary_result(unique_records, resp)
+                self._update_summary_result(unique_records, resp, year)
                 if stat == "2":
                     code, msg = 200, f"推送成功 {record_cnt} 条"
                 else:
-                    code = 206
+                    code = 500
                     ret_msg = resp.get("msg") or "SAP返回失败"
                     msg = f"推送失败 {record_cnt} 条; {ret_msg}"
             except Exception as e:
                 traceback.print_exc()
-                code = 206
+                code = 500
                 msg = f"推送异常 {record_cnt} 条; {e}"
                 # 异常时把整批置为失败
                 fail_resp = {"mat_doc": "", "doc_year": "", "msg": str(e), "stat": "D"}
-                self._update_summary_result(unique_records, fail_resp)
+                self._update_summary_result(unique_records, fail_resp, year)
         # 回查最终状态(供前端刷新表格)
         data, display = self._query_data(body)
         return {"code": code, "msg": msg, "data": data, "display": display}
@@ -329,7 +327,6 @@ class SemiproductDeductPush:
         else:
             full_query_sql = query_sql + sort_sql
         full_query_sql = full_query_sql.replace("    ", " ").strip()
-        print(full_query_sql)
         query_data = self.db.query_sql(full_query_sql)
 
         display = [
@@ -350,11 +347,12 @@ class SemiproductDeductPush:
 
         return query_data, display
 
-    def _get_pending_list(self, plant_code, year, period, summary_unique_number="", summary_type=None):
+    def _get_pending_list(self, plant_code, year, period, summary_unique_number="", summary_type=None, movement_type=None):
         """查询待推送的半成品扣料记录
-                  按 t_co_summary_report 的 plant/year/period 取(不再按 movement_type 过滤;
-                  movement_type 随 body 传, 仅推送 SAP 时用), 并以 posting_status != '3' 作为待推送
-                  (成功存3, 不再重复推; 失败存2仍可重推)。
+                  按 t_co_summary_report 的 plant/year/period 取, 并按请求传入的 movement_type 区分可推送的过账状态:
+                    movement_type=261(正向发料): posting_status IN ('1','2') 待推/失败可重推;
+                    movement_type=262(反向冲销): posting_status='3' 只能冲销已过账成功的记录;
+                    其它/未传:                 退化为 posting_status != '3'。
                   若传 summary_unique_number(可配 summary_type) 则只取该汇总单的明细。
         :return: list[dict]
         """
@@ -362,20 +360,30 @@ class SemiproductDeductPush:
             f" AND `plant_code`='{plant_code}'"
             f" AND `year`='{year}'"
             f" AND `period`='{period}'"
-            f" AND `posting_status`!='3'"
         )
+        # 按请求传入的 movement_type 决定可推送的过账状态(posting_status):
+        #   261(正向发料) -> IN ('1','2'): 待推/失败可重推;
+        #   262(反向冲销) -> = '3': 只能冲销正向已过账成功的记录;
+        #   其它/未传     -> != '3': 兜底。
+        mtype = str(movement_type) if movement_type not in (None, "") else ""
+        if mtype == self.MOVE_TYPE_POS:
+            cond += " AND `posting_status` IN ('1','2')"
+        elif mtype == self.MOVE_TYPE_NEG:
+            cond += " AND `posting_status`='3'"
+        else:
+            cond += " AND `posting_status`!='3'"
         if summary_unique_number:
             cond += f" AND `summary_unique_number`='{summary_unique_number}'"
         if summary_type not in (None, ""):
             cond += f" AND `summary_type`='{summary_type}'"
         cond += " ORDER BY `id` ASC"
         cols = (
-            "`id`,`prodosn`,`summary_line`,`movement_type`,`plant_code`,`mat_code`,"
+            "`id`,`prodosn`,`summary_type`,`summary_unique_number`,`summary_line`,"
+            "`movement_type`,`plant_code`,`mat_code`,"
             "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
             "`special_inventory_status`,`summary_date`"
         )
         data = query_db_records_by_cond(self.db, self.SOURCE_TABLE, cond, cols)
-        print("查询待推送半成品扣料记录--", data)
         return data
 
     # ==================== SAP 货物移动 组装/发送/解析/回写 ====================
@@ -402,7 +410,6 @@ class SemiproductDeductPush:
             "P_BUKRS": self.BUKRS,
             "P_ITEM": item_table,
         }
-        print("组装SAP 货物移动请求数据完成---", sap_send_data)
         return sap_send_data
 
     def _insert_mid_table(self, records, ip_index):
@@ -425,7 +432,7 @@ class SemiproductDeductPush:
         try:
             now = datetime.now()
             datum, uzeit = now.strftime("%Y%m%d"), now.strftime("%H%M%S")
-            # 这里是单条推送 TDD
+            # 远程表(dblink)不支持 INSERT ALL, 逐行单条 INSERT
             row_count = 0
             for idx, record in enumerate(records, start=1):
                 row = {
@@ -435,15 +442,13 @@ class SemiproductDeductPush:
                     "AUFNR": record.get("prodosn", ""),
                     # 文档: ZCOUNT ← summary_line(与返回 P_WLPZ.ZEILE 同源); 缺失才用序号兜底
                     "ZCOUNT": record.get("summary_line") if record.get("summary_line") not in (None, "") else idx,
-                    "BWART": str(record.get("movement_type") or "").strip() or self.MOVE_TYPE_POS,
+                    "BWART": self.movement_type,
                     "WERKS": record.get("plant_code", "") or self.PLANT_DEFAULT,
                     "MATNR": record.get("mat_code", ""),
                     "ERFMG": self._parse_amount(record.get("consump_qty")),
                     "ERFME": record.get("basic_uom", ""),
                     "CHARG": record.get("batch_sn", ""),
                     "ZUSER": record.get("create_id", ""),
-                    # "DATUM_B": datum,
-                    # "UZEIT_B": uzeit,
                     "ZDATE": datum,
                     "ZTIME": uzeit,
                     "BUKRS": self.BUKRS,
@@ -451,7 +456,6 @@ class SemiproductDeductPush:
                     "PROCESS_FLG": self.PROCESS_FLG_INIT,
                     "LGORT": self.STGE_LOC_DEFAULT,
                 }
-                print("ZTIME-----", row["ZTIME"])
                 vals = []
                 for col in self.MID_TABLE_COLUMNS:
                     v = row[col]
@@ -474,31 +478,6 @@ class SemiproductDeductPush:
         finally:
             oracle.close()
 
-    def _query_mid_table_times(self, ip_index):
-        """INSERT 后回查中间表 ZMES_MM_GOODSREC_MHXT 的开始/结束 日期时间四字段
-            测试时区的，随时可以删
-        """
-        schema = get_schema()
-        table = "{s}.{t}".format(s=schema, t=self.MID_TABLE) if schema else self.MID_TABLE
-        sql = (
-            "SELECT DATUM_B, DATUM_E, UZEIT_B, UZEIT_E, ZDATE, ZTIME"
-            " FROM {t}"
-            " WHERE IP_INDEX = '{ip}'"
-            " ORDER BY ZCOUNT"
-        ).format(t=table, ip=ip_index)
-        oracle = OracleDB()
-        try:
-            # Oracle 数据库当前时间(便于和时间字段对比时区/写入时刻)
-            now_row = oracle.query(
-                "SELECT TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') AS NOW FROM DUAL"
-            )
-            print("===Oracle 当前时间=== {n}".format(n=now_row))
-            rows = oracle.query(sql)
-            print("===中间表时间字段回查(ip_index={ip})=== {r}".format(ip=ip_index, r=rows))
-            return rows
-        finally:
-            oracle.close()
-
     def _build_gm_header(self, records):
         """组装抬头 P_HEADER: 记账日期/凭证日期取首条 summary_date, 抬头文本"""
         first = records[0] or {}
@@ -512,9 +491,9 @@ class SemiproductDeductPush:
     def _build_gm_item(self, record, idx):
         """组装 P_ITEM 行(半成品: 含 ORDERID 生产订单号)
 
-        MOVE_TYPE 取记录 movement_type(261/262); 缺失按正向 261 兜底。
+        MOVE_TYPE 取本次请求传入的 movement_type(self.movement_type, 整批共用)。
         """
-        move_type = str(record.get("movement_type") or "").strip() or self.MOVE_TYPE_POS
+        move_type = self.movement_type
         return {
             "MATERIAL": str(record.get("mat_code", "") or ""),        # 物料编码
             "PLANT": str(record.get("plant_code", "") or self.PLANT_DEFAULT),  # 工厂(文档固定 RAC1)
@@ -522,7 +501,6 @@ class SemiproductDeductPush:
             "BATCH": str(record.get("batch_sn", "") or ""),           # 批次
             "MOVE_TYPE": move_type,                                    # 移动类型 261/262
             "STCK_TYPE": str(record.get("special_inventory_status", "") or ""),  # 库存类型
-            # "MOVE_REAS": "",                                           # 移动原因(空)
             "ENTRY_QNT": self._parse_amount(record.get("consump_qty")),    # 数量
             "ENTRY_UOM": str(record.get("basic_uom", "") or ""),      # 单位
             "ORDERID": str(record.get("prodosn", "") or ""),          # 订单编号(SAP工单号)
@@ -543,44 +521,47 @@ class SemiproductDeductPush:
     def _send_gm_request(self, sap_send_data):
         """调用 SAPRFC 推送 ZRFC_MM_GNRTRANS_RACQ"""
         sap_resp = SAPRFC().call(self.INTERFACE_CODE, sap_send_data)
-        print(f"===货物移动RFC返回结果===: {sap_resp}")
         return sap_resp
 
     def _extract_gm_response(self, sap_resp):
-        """解析 Sap 返回 P_RETURN(物料凭证/年度/状态/消息)
+        """解析 Sap 返回(物料凭证/年度/状态/消息 + P_WLPZ 逐行明细)
 
-        :return: dict {mat_doc, doc_year, stat, msg}
-                 stat: '2' 成功 / 'D' 失败
+        :return: dict {mat_doc, doc_year, stat, msg, p_wlpz}
+                 mat_doc: 物料凭证号(取自 P_WLPZ 首行 MBLNR, 写入 associated_doc_sn);
+                 p_wlpz : 逐行明细列表(每行含 MBLNR/DMBTR 等, 与推送行序一一对应);
+                 stat   : '2' 成功 / 'D' 失败。
         """
         print("货物移动RFC返回结果---", sap_resp)
         sap_resp = sap_resp or {}
         p_return = sap_resp.get("P_RETURN") or {}
+        p_doc = sap_resp.get("P_DOC") or {}
+        p_wlpz = sap_resp.get("P_WLPZ") or []
 
         def pick(*keys, default=""):
             for k in keys:
-                val = sap_resp.get(k)
-                if val is None or val == "":
-                    val = p_return.get(k)
-                if val is not None and val != "":
-                    return val
+                for src in (sap_resp, p_return, p_doc):
+                    val = src.get(k)
+                    if val is not None and val != "":
+                        return val
             return default
 
+        # 物料凭证号: 优先取 P_WLPZ 首行 MBLNR(=associated_doc_sn), 否则退到 MAT_DOC
+        mblnr = str((p_wlpz[0].get("MBLNR") if p_wlpz else "") or "")
+        if not mblnr:
+            mblnr = str(pick("MAT_DOC", "MAT_DO", "MATDOC"))
+
         return {
-            "mat_doc": pick("MAT_DO", "MATDOC"),    # 物料凭证编号
+            "mat_doc": mblnr,                       # 物料凭证号(=MBLNR)
             "doc_year": pick("DOC_YEAR"),           # 物料凭证年度
             "stat": str(pick("STAT", default="D")), # 2 成功 / D 失败
             "msg": pick("MSG"),                     # 操作信息
+            "p_wlpz": p_wlpz,                       # 逐行明细(每行 MBLNR/DMBTR 等)
         }
 
-    def _update_summary_result(self, records, resp):
-        """回写结果表 + 源表: 物料凭证号/年度/状态/消息
-
-        状态映射(新逻辑): SAP 成功(stat='2') -> 表里存 3; 失败(stat='D'等) -> 表里存 2。
+    def _update_summary_result(self, records, resp, year=""):
+        """回写结果表 + 源表: 物料凭证号(MBLNR)/金额(DMBTR)/年度/状态/消息
+        状态映射: SAP 成功(stat='2') -> 表里存 3; 失败(stat='D'等) -> 表里存 2。
         两张表共用同一映射(由 _map_posting_status 统一换算):
-          t_co_summary_result.status         (按 prodosn + summary_line 逐条更新)
-          t_co_summary_report.posting_status (按 id 批量更新)
-
-        本函数在 成功响应 / 失败响应 / 异常 三个路径都被调用, 故源表也会随之更新,
         无需在调用方再单独处理。
         """
         if not records:
@@ -599,22 +580,31 @@ class SemiproductDeductPush:
             update_db_record_by_cond(self.db, self.SOURCE_TABLE, src_cond, ("posting_status",),
                                      {"posting_status": store_status})
 
-        # 结果表 t_co_summary_result: 按 prodosn + summary_line 逐条更新
-        for record in records:
-            prodosn = record.get("prodosn", "")
+        p_wlpz = resp.get("p_wlpz") or []
+        update_cols = ("associated_doc_sn", "amount", "year", "status", "post_account_msg", "update_time")
+        for idx, record in enumerate(records):
+            # 结果表唯一键 (summary_type, summary_unique_number, summary_line); prodosn 不可用作定位键。
+            summary_type = str(record.get("summary_type", "") or "")
+            summary_unique_number = str(record.get("summary_unique_number", "") or "")
             summary_line = record.get("summary_line", "")
-            if not prodosn:
+            if not summary_type or not summary_unique_number:
                 continue
-            cond = f" AND `prodosn`='{prodosn}' AND `summary_line`='{summary_line}'"
-            data = {
-                "associated_doc_sn": mat_doc,
-                "year": doc_year,
+            key_cond = (
+                f" AND `summary_type`='{summary_type}'"
+                f" AND `summary_unique_number`='{summary_unique_number}'"
+                f" AND `summary_line`='{summary_line}'"
+            )
+            wlpz = p_wlpz[idx] if idx < len(p_wlpz) else {}
+            row_data = {
+                "associated_doc_sn": str(wlpz.get("MBLNR") or mat_doc),  # 本行物料凭证号(缺失用批级兜底)
+                "amount": self._parse_amount(wlpz.get("DMBTR")),         # 本行本币金额
+                "year": doc_year or year,                                # 物料凭证年度优先, 缺失退到会计年度
                 "status": store_status,
                 "post_account_msg": msg,
                 "update_time": now_str,
             }
-            cols = ("associated_doc_sn", "year", "status", "post_account_msg", "update_time")
-            update_db_record_by_cond(self.db, self.RESULT_TABLE, cond, cols, data)
+            update_db_record_by_cond(self.db, self.RESULT_TABLE, key_cond, update_cols, row_data)
+
         self.db.dbCommit()
 
     @staticmethod
@@ -666,10 +656,7 @@ def semiproduct_deduct_query(body):
         res.commit(True)
 
 
-
-
-body = {'summary_unique_number': '00f2f6c87dc03297f36ce2e201d95947','summary_type': 11, 'plant_code': 'RAC1', 'period': '07', 'path': '', 'year': '2026'}
-
+body = {'summary_unique_number': 'f0186d008156762431e8fb995a99a64e','movement_type':'261','summary_type': 11, 'plant_code': 'RAC1', 'period': '07', 'path': '', 'year': '2026'}
 
 
 @calc_time

@@ -22,7 +22,6 @@ import json
 import traceback
 from datetime import datetime
 
-import pyrfc
 from DbHelper import DbHelper
 from libenhance import Request, Response, get_cnf
 from logger import LoggerConfig
@@ -43,8 +42,6 @@ usprint = LoggerConfig()
 
 
 class BomMaterialDeduct:
-
-
     # ---------- 固定值(按接口文档 v1.1, 集中维护) ----------
     # SAP接口编码 / RFC函数名
     INTERFACE_CODE = "ZRFC_MM_GNRTRANS_RACQ"
@@ -61,12 +58,10 @@ class BomMaterialDeduct:
         "MANDT", "IP_NO", "IP_INDEX", "ZCOUNT", "MATNR", "WERKS", "BWART",
         "INSMK", "ERFMG", "ERFME", "S_LGORT", "S_CHARG",
         "ZDATE", "ZTIME", "BUKRS", "USRID", "PROCESS_FLG",
-        "ZTEXT3", "BUDAT",
-    ]
+        "ZTEXT3", "BUDAT",]
 
     # BAPI 货物移动事务代码 / 公司代码 / 工厂
-    # GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
-    GM_CODE = "11"                      # 在润工作上沟通过，
+    GM_CODE = "03"                      # P_CODE.GM_CODE 固定值 03(MB1A)
     BUKRS = "RACQ"                      # P_BUKRS 固定 RACQ
     PLANT_DEFAULT = "RAC1"              # 工厂(文档固定值 RAC1)
     USRID = "MH"                        # 用户名(文档固定 MH)
@@ -74,8 +69,6 @@ class BomMaterialDeduct:
     # 移动类型: 201/Y01 正向领用 / 202/Y02 反向冲销
     MOVE_TYPE_POS_LIST = ("201", "Y01")
     MOVE_TYPE_NEG_LIST = ("202", "Y02")
-    MOVE_TYPE_ALL = MOVE_TYPE_POS_LIST + MOVE_TYPE_NEG_LIST
-    MOVE_TYPE_POS = "201"               # 缺失时兜底
 
     # 源表 / 结果表
     SOURCE_TABLE = "t_co_summary_report"
@@ -87,13 +80,13 @@ class BomMaterialDeduct:
 
     def __init__(self):
         self.db = DbHelper()
+        self.movement_type = ""   # 本次推送移动类型(_push_core 赋值, _insert_mid_table/_build_gm_item 读取)
 
     # ==================== 公共入口(按钮) ====================
     def push(self, body):
         """搭BOM材料扣料接口: 传入 body, 返回 {code,msg,data,display}。
 
         :param body: 请求体(dict; 传 JSON 字串会自动 json.loads)。
-        :param user_id: 操作人 id(仅用于日志, 默认 0)。
         :return: 成功/失败 {"code","msg","data","display"};
                  参数校验失败返回 {"code":500,"msg":..,"data":None}。
         """
@@ -111,10 +104,12 @@ class BomMaterialDeduct:
         # (缺省时退化为按 plant/year/period 推全部待推)
         summary_unique_number = payload.get("summary_unique_number") or ""
         summary_type = payload.get("summary_type")
+        movement_type = payload.get("movement_type")
 
         res_bus = self._push_core(params["year"], params["period"], params["plant_code"],
                                   summary_unique_number=summary_unique_number,
-                                  summary_type=summary_type)
+                                  summary_type=summary_type,
+                                  movement_type=movement_type)
         print(f"===搭BOM材料扣料接口=== 处理结束!!! 返回: {res_bus}")
         return res_bus
 
@@ -218,19 +213,21 @@ class BomMaterialDeduct:
         return True, "校验通过", params
 
     # ==================== 推送核心 ====================
-    def _push_core(self, year, period, plant_code, summary_unique_number="", summary_type=None):
+    def _push_core(self, year, period, plant_code, summary_unique_number="", summary_type=None, movement_type=None):
         """搭BOM材料扣料 核心逻辑(605 core)
         查待推送扣料记录, 一次性合并调 SAP 货物移动 RFC, 回写结果, 回查最新状态。
 
         :param summary_unique_number: 指定推送某张汇总单; 空则按 plant/year/period 推全部待推。
         :param summary_type: 配套的汇总类型(与 summary_unique_number 组成唯一键)。
+        :param movement_type: 移动类型(201正向领用/202反向冲销), 决定本次可推送的过账状态。
         :return: {"code", "msg", "data", "display"}
         """
-        code, msg = 200, "无可推送记录"
+        code, msg = 500, "无可推送记录"
         body = {"data": {"year": year, "period": period, "plant_code": plant_code}}
+        # 本次推送的移动类型(来自请求, 整批共用), 供 _insert_mid_table / _build_gm_item 传 SAP
+        self.movement_type = str(movement_type or "").strip()
         # 查询待推送记录
-        records = self._get_pending_list(plant_code, year, period, summary_unique_number, summary_type)
-        print("待推送记录--", records)
+        records = self._get_pending_list(plant_code, year, period, summary_unique_number, summary_type, movement_type)
         # 按 id 去重
         push_dict = {}
         unique_records = []
@@ -258,12 +255,12 @@ class BomMaterialDeduct:
                 if stat == "2":
                     code, msg = 200, f"推送成功 {record_cnt} 条"
                 else:
-                    code = 206
+                    code = 500
                     ret_msg = resp.get("msg") or "SAP返回失败"
                     msg = f"推送失败 {record_cnt} 条; {ret_msg}"
             except Exception as e:
                 traceback.print_exc()
-                code = 206
+                code = 500
                 msg = f"推送异常 {record_cnt} 条; {e}"
                 # 异常时把整批置为失败
                 fail_resp = {"mat_doc": "", "doc_year": "", "msg": str(e), "stat": "D"}
@@ -326,7 +323,6 @@ class BomMaterialDeduct:
             full_query_sql = query_sql + sort_sql
 
         full_query_sql = full_query_sql.replace("    ", " ").strip()
-        print(full_query_sql)
         query_data = self.db.query_sql(full_query_sql)
 
         display = [
@@ -347,11 +343,12 @@ class BomMaterialDeduct:
         return query_data, display
 
     # ==================== SAP 货物移动 组装/发送/解析/回写 ====================
-    def _get_pending_list(self, plant_code, year, period, summary_unique_number="", summary_type=None):
+    def _get_pending_list(self, plant_code, year, period, summary_unique_number="", summary_type=None, movement_type=None):
         """查询待推送的搭BOM材料扣料记录
-                  按 t_co_summary_report 的 plant/year/period 取(不再按 movement_type 过滤;
-                  movement_type 随 body 传, 仅推送 SAP 时用), 并以 posting_status != '3' 作为待推送
-                  (成功存3, 不再重复推; 失败存2仍可重推)。
+                  按 t_co_summary_report 的 plant/year/period 取, 并按请求传入的 movement_type 区分可推送的过账状态:
+                    movement_type=201(正向领用): posting_status IN ('1','2') 待推/失败可重推;
+                    movement_type=202(反向冲销): posting_status='3' 只能冲销已过账成功的记录;
+                    其它/未传:                 退化为 posting_status != '3'。
                   若传 summary_unique_number(可配 summary_type) 则只取该汇总单的明细。
         :return: list[dict]
         """
@@ -359,20 +356,29 @@ class BomMaterialDeduct:
             f" AND `plant_code`='{plant_code}'"
             f" AND `year`='{year}'"
             f" AND `period`='{period}'"
-            f" AND `posting_status`!='3'"
         )
+        # 按请求传入的 movement_type 决定可推送的过账状态(posting_status):
+        #   201(正向领用) -> IN ('1','2'): 待推/失败可重推;
+        #   202(反向冲销) -> = '3': 只能冲销正向已过账成功的记录;
+        #   其它/未传     -> != '3': 兜底。
+        mtype = str(movement_type) if movement_type not in (None, "") else ""
+        if mtype in self.MOVE_TYPE_POS_LIST:
+            cond += " AND `posting_status` IN ('1','2')"
+        elif mtype in self.MOVE_TYPE_NEG_LIST:
+            cond += " AND `posting_status`='3'"
+        else:
+            cond += " AND `posting_status`!='3'"
         if summary_unique_number:
             cond += f" AND `summary_unique_number`='{summary_unique_number}'"
         if summary_type not in (None, ""):
             cond += f" AND `summary_type`='{summary_type}'"
         cond += " ORDER BY `id` ASC"
         cols = (
-            "`id`,`summary_line`,`movement_type`,`plant_code`,`mat_code`,"
+            "`id`,`summary_type`,`summary_unique_number`,`summary_line`,`movement_type`,`plant_code`,`mat_code`,"
             "`consump_qty`,`basic_uom`,`batch_sn`,`stor_loc_code`,"
             "`special_inventory_status`,`summary_date`,`cost_center`,`cost_element`"
         )
         data = query_db_records_by_cond(self.db, self.SOURCE_TABLE, cond, cols)
-        print("查询待推送搭BOM材料扣料记录--", data)
         return data
 
     def _prepare_gm_request(self, records, ip_index):
@@ -396,7 +402,6 @@ class BomMaterialDeduct:
             "P_BUKRS": self.BUKRS,
             "P_ITEM": item_table,
         }
-        print("组装SAP 货物移动请求数据完成---", sap_send_data)
         return sap_send_data
 
     def _insert_mid_table(self, records, ip_index):
@@ -432,7 +437,7 @@ class BomMaterialDeduct:
                     "ZCOUNT": record.get("summary_line") if record.get("summary_line") not in (None, "") else idx,
                     "MATNR": record.get("mat_code", ""),
                     "WERKS": record.get("plant_code", "") or self.PLANT_DEFAULT,
-                    "BWART": str(record.get("movement_type") or "").strip() or self.MOVE_TYPE_POS,
+                    "BWART": self.movement_type,
                     "INSMK": record.get("special_inventory_status", ""),               # 库存类型(质检2/非限制F/冻结3)
                     "ERFMG": self._parse_amount(record.get("consump_qty")),
                     "ERFME": record.get("basic_uom", ""),
@@ -444,7 +449,6 @@ class BomMaterialDeduct:
                     "USRID": self.USRID,
                     "PROCESS_FLG": self.PROCESS_FLG_INIT,
                     "ZTEXT3": record.get("cost_center", ""),                           # 成本中心(必填)
-                    # "SAKTO": record.get("cost_element", ""),                           # 总账科目/成本要素
                     "BUDAT": self._to_ymd(record.get("summary_date")) or datum,         # 过账日期(汇总日期)
                 }
 
@@ -482,9 +486,9 @@ class BomMaterialDeduct:
 
     def _build_gm_item(self, record, idx):
         """组装 P_ITEM 行(搭BOM: 含 COSTCENTER 成本中心 + GL_ACCOUNT 成本要素, 无 ORDERID)
-        MOVE_TYPE 取记录 movement_type(201/202/Y01/Y02); 缺失按正向 201 兜底。
+        MOVE_TYPE 取本次请求传入的 movement_type(self.movement_type, 整批共用)。
         """
-        move_type = str(record.get("movement_type") or "").strip() or self.MOVE_TYPE_POS
+        move_type = self.movement_type
         return {
             "MATERIAL": str(record.get("mat_code", "") or ""),        # 物料编码
             "PLANT": str(record.get("plant_code", "") or self.PLANT_DEFAULT),  # 工厂(文档固定 RAC1)
@@ -492,7 +496,6 @@ class BomMaterialDeduct:
             "BATCH": str(record.get("batch_sn", "") or ""),           # 批次
             "MOVE_TYPE": move_type,                                    # 移动类型 201/202/Y01/Y02
             "STCK_TYPE": str(record.get("special_inventory_status", "") or ""),  # 库存类型
-            # "MOVE_REAS": "",                                           # 移动原因(空)
             "ENTRY_QNT": self._parse_amount(record.get("consump_qty")),    # 数量
             "ENTRY_UOM": str(record.get("basic_uom", "") or ""),      # 单位
             "COSTCENTER": str(record.get("cost_center", "") or ""),   # 成本中心
@@ -513,40 +516,40 @@ class BomMaterialDeduct:
     def _send_gm_request(self, sap_send_data):
         """调用 SAPRFC 推送 ZRFC_MM_GNRTRANS_RACQ"""
         sap_resp = SAPRFC().call(self.INTERFACE_CODE, sap_send_data)
-        print(f"===货物移动RFC返回结果===: {sap_resp}")
         return sap_resp
 
     def _extract_gm_response(self, sap_resp):
-        """解析 SAP 返回 P_RETURN(物料凭证/年度/状态/消息)
+        """解析 SAP 返回(物料凭证/年度/状态/消息)
         :return: dict {mat_doc, doc_year, stat, msg}
-                 stat: '2' 成功 / 'D' 失败
+                 mat_doc: 物料凭证号(取自 P_DOC/P_RETURN.MAT_DOC, 写入 associated_doc_sn);
+                 stat   : '2' 成功 / 'D' 失败。
         """
         print("货物移动RFC返回结果---", sap_resp)
         sap_resp = sap_resp or {}
         p_return = sap_resp.get("P_RETURN") or {}
+        p_doc = sap_resp.get("P_DOC") or {}
 
         def pick(*keys, default=""):
             for k in keys:
-                val = sap_resp.get(k)
-                if val is None or val == "":
-                    val = p_return.get(k)
-                if val is not None and val != "":
-                    return val
+                for src in (sap_resp, p_return, p_doc):
+                    val = src.get(k)
+                    if val is not None and val != "":
+                        return val
             return default
 
         return {
-            "mat_doc": pick("MAT_DO", "MATDOC"),    # 物料凭证编号
-            "doc_year": pick("DOC_YEAR"),           # 物料凭证年度
-            "stat": str(pick("STAT", default="D")), # 2 成功 / D 失败
-            "msg": pick("MSG"),                     # 操作信息
+            "mat_doc": pick("MAT_DOC", "MAT_DO", "MATDOC"),  # 物料凭证编号
+            "doc_year": pick("DOC_YEAR"),                    # 物料凭证年度
+            "stat": str(pick("STAT", default="D")),          # 2 成功 / D 失败
+            "msg": pick("MSG"),                              # 操作信息
         }
 
     def _update_summary_result(self, records, resp):
         """回写结果表 + 源表: 物料凭证号/年度/状态/消息
 
-        状态映射(新逻辑): SAP 成功(stat='2') -> 表里存 3; 失败(stat='D'等) -> 表里存 2。
+        状态映射: SAP 成功(stat='2') -> 表里存 3; 失败(stat='D'等) -> 表里存 2。
         两张表共用同一映射(由 _map_posting_status 统一换算):
-          t_co_summary_result.status         (按 summary_line 逐条更新)
+          t_co_summary_result.status         (按唯一键 summary_type+summary_unique_number+summary_line 逐条更新)
           t_co_summary_report.posting_status (按 id 批量更新)
 
         本函数在 成功响应 / 失败响应 / 异常 三个路径都被调用, 故源表也会随之更新,
@@ -568,10 +571,18 @@ class BomMaterialDeduct:
             update_db_record_by_cond(self.db, self.SOURCE_TABLE, src_cond, ("posting_status",),
                                      {"posting_status": store_status})
 
-        # 结果表 t_co_summary_result: 按 summary_line 逐条更新
+        # 结果表 t_co_summary_result: 按唯一键 (summary_type, summary_unique_number, summary_line) 逐条更新
         for record in records:
+            summary_type = str(record.get("summary_type", "") or "")
+            summary_unique_number = str(record.get("summary_unique_number", "") or "")
             summary_line = record.get("summary_line", "")
-            cond = f" AND `summary_line`='{summary_line}'"
+            if not summary_type or not summary_unique_number:
+                continue
+            cond = (
+                f" AND `summary_type`='{summary_type}'"
+                f" AND `summary_unique_number`='{summary_unique_number}'"
+                f" AND `summary_line`='{summary_line}'"
+            )
             data = {
                 "associated_doc_sn": mat_doc,
                 "year": doc_year,
@@ -637,7 +648,7 @@ def bom_material_deduct_query(body):
 
 
 
-body = {'summary_unique_number': '00f2f6c87dc03297f36ce2e201d95947','summary_type': 11, 'plant_code': 'RAC1', 'period': '07', 'path': '', 'year': '2026'}
+body = {'summary_unique_number': '00f2f6c87dc03297f36ce2e201d95947','movement_type':'201','summary_type': 11, 'plant_code': 'RAC1', 'period': '07', 'path': '', 'year': '2026'}
 
 
 
