@@ -24,7 +24,6 @@ from datetime import datetime
 
 from DbHelper import DbHelper
 from libenhance import Request, Response, get_cnf
-from logger import LoggerConfig
 from ToolsMethods import (
     GetExportData,
     Paginator,
@@ -36,9 +35,6 @@ from ToolsMethods import (
 from utils import query_db_records_by_cond, update_db_record_by_cond
 from ZZEXT_OracleHandle import OracleDB, get_schema
 from ZZEXT_SapRFC import SAPRFC
-
-usprint = LoggerConfig()
-
 
 
 class BomMaterialDeduct:
@@ -80,8 +76,7 @@ class BomMaterialDeduct:
 
     def __init__(self):
         self.db = DbHelper()
-        self.movement_type = ""   # 本次推送移动类型(_push_core 赋值, _insert_mid_table/_build_gm_item 读取)
-
+        self.movement_type = ""   # 本次推送移动类型
     # ==================== 公共入口(按钮) ====================
     def push(self, body):
         """搭BOM材料扣料接口: 传入 body, 返回 {code,msg,data,display}。
@@ -383,7 +378,6 @@ class BomMaterialDeduct:
 
     def _prepare_gm_request(self, records, ip_index):
         """组装 SAP 货物移动请求(ZRFC_MM_GNRTRANS_RACQ)
-
         入参(按文档):
           P_HEADER  : 抬头 {PSTNG_DATE, DOC_DATE, HEADER_TXT}
           P_CODE    : {GM_CODE: '03'}

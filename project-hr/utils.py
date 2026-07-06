@@ -149,6 +149,9 @@ def update_db_record_by_cond(db, table_name, cond, cols, data):
     sql = f"UPDATE `{table_name}` SET {','.join(update_cols)}  WHERE 1  =1  {cond};"
     print(f"[{table_name}] {sql}")
     status = db.exec_sql(sql)
+    if status == 0:
+        print(f'更新{table_name}记录{cond}成功, 但没有匹配到任何记录')
+        return status
     if status == -1:
         raise Exception(f'更新{table_name}记录{cond}失败')
 

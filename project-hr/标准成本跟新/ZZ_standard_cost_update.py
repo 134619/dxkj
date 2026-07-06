@@ -404,7 +404,6 @@ class StandardCostUpdate:
 
     def _extract_price_change_response(self, sap_resp):
         """解析SAP返回数据
-
         响应字段位置:
           P_RET(2成功/3失败) / P_MSG(详情)        -> 顶层单参数
           ML_DOC_NUM(价格更改凭证号) / ML_DOC_YEAR -> 输出结构行 PRICECHANGEDOCUMENT
@@ -469,8 +468,7 @@ class StandardCostUpdate:
 
     @staticmethod
     def _normalize_list_param(value):
-        """把请求参数归一成 list[str](去空白/空串)。
-        兼容前端多选: ['a','b'] / ('a',) / 'a' / None / '' -> ['a','b'] / ['a'] / []。
+        """把请求参数归一成 list   兼容前端多选
         """
         if value is None:
             return []
