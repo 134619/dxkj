@@ -621,7 +621,6 @@ def send_rfc_request(rfc_data):
 
 def extract_mass_response(sap_resp, pushed_list, row_sun_map):
     """把 DATA_OUT 归并到各凭证(DATA_IN 无 IP_INDEX)
-
     归并策略:
       1) 主: DATA_IN 无 IP_INDEX, 靠"输入行顺序"与 DATA_OUT 行顺序一一对应还原每行所属凭证
          (row_sun_map 与 data_in 同序, 精确、不受归档凭证号重复影响)。
