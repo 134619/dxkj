@@ -1,20 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 """
-@File    : ZZITF_Asset_Depreciation_Detail.py
+@File    : ZZITF_AssetDepreciationDetail.py
 @Date    : 2026/07/09
+@Author  : yang.zhang@dxdstech.com
 @explain : 资产折旧明细接收接口: 前端传 data, 落库 ut_discount_details
 
   职责:
     前端把折旧明细参数放在 body.data 里调本接口, 直接插入 ut_discount_details 表。
     必填: year, period, company_code, asset_code, item; 其余字段有则存, 无则不存。
-
-  二开命名约定(重要):
-    库里 表名加 ut_ 前缀, 业务字段加 uf_ 前缀(uf_year/uf_item/uf_module/uf_text...),
-    审计列(id/create_id/create_time/update_id/update_time/note)不加前缀。
-    前端传入用逻辑名(year/item/module/text...), 接口内部按 FIELD_MAP 映射到库表字段名, 值不变。
-    batchInsertToDB 按 information_schema.COLUMN_NAME 严格大小写匹配列名, 故 FIELD_MAP 的
-    列名大小写须与建表一致(本表业务字段均为小写)。
 
   请求体示例:
     {
@@ -35,19 +29,20 @@ from ToolsMethods import ResetResponse, ResponseData, ResponseStatusCode
 TABLE = "ut_discount_details"
 
 # ==================== 字段映射: 前端逻辑名 -> 库表字段名 ====================
-# 业务字段 uf_ 前缀(均小写, 与建表一致); note 为审计列, 不加前缀
+# 业务字段 uf_ 前缀; 注意 uf_Item/uf_Module/uf_Text 建表首字母大写,
+# batchInsertToDB 按 information_schema.COLUMN_NAME 严格大小写匹配列名, 必须与建表完全一致。
 FIELD_MAP = {
     "year":            "uf_year",
     "period":          "uf_period",
     "company_code":    "uf_company_code",
     "asset_code":      "uf_asset_code",
     "asset_type":      "uf_asset_type",
-    "item":            "uf_item",
+    "item":            "uf_Item",
     "currency_amount": "uf_currency_amount",
     "currency":        "uf_currency",
     "center":          "uf_center",
-    "module":          "uf_module",
-    "text":            "uf_text",
+    "module":          "uf_Module",
+    "text":            "uf_Text",
     "note":            "note",
 }
 

@@ -94,8 +94,8 @@ _UOMCONV_FIELDS = [
 
 # ==================== 数仓源列(ads_cost_erp_material_info) ====================
 # 数仓表 ads_cost_erp_material_info 列名与 0701 文档字段完全同名,
-# 故 SELECT 直接取文档字段, 不需要 ERP→烽火字段映射/别名。
-# 增量基线 = 烽火 t_mmd_material_basic_data.MAX(update_time), 见 _get_max_update_time。
+# 故 SELECT 直接取文档字段, 不需要 ERP→秘火字段映射/别名。
+# 增量基线 = 秘火 t_mmd_material_basic_data.MAX(update_time), 见 _get_max_update_time。
 
 
 # ==================== 工具: 表行 -> 嵌套结构 ====================
@@ -212,7 +212,7 @@ def _pg_literal(value):
 
 
 def _get_max_update_time(db):
-    """取烽火 t_mmd_material_basic_data 的最大 update_time(增量同步基线); 表空返回 None。"""
+    """取秘火 t_mmd_material_basic_data 的最大 update_time(增量同步基线); 表空返回 None。"""
     rows = db.query_sql("SELECT MAX(`update_time`) AS `max_ut` FROM `t_mmd_material_basic_data`")
     if rows and rows[0].get("max_ut"):
         return rows[0]["max_ut"]
@@ -221,7 +221,7 @@ def _get_max_update_time(db):
 
 def _query_source_batch(pg, max_ut, cursor_ut, cursor_mc, limit=BATCH_SIZE):
     """分批查数仓 ads_cost_erp_material_info:
-    增量条件 update_time > 烽火最大 update_time(max_ut); max_ut 为空则全量(不加该条件)。游标 (cursor_ut, cursor_mc)
+    增量条件 update_time > 秘火最大 update_time(max_ut); max_ut 为空则全量(不加该条件)。游标 (cursor_ut, cursor_mc)
     续读避免重复/漏行(cursor_mc 为 None 即第一批)。按 (update_time, mat_code) 排序。
     """
     
@@ -231,7 +231,7 @@ def _query_source_batch(pg, max_ut, cursor_ut, cursor_mc, limit=BATCH_SIZE):
     # print(max_ut)
     # print(cursor_ut)
     # print(cursor_mc)
-    # if max_ut:   # 有基线才加增量条件; 空(烽火表空/无值) -> 全量, 不用 update_time 作条件
+    # if max_ut:   # 有基线才加增量条件; 空(秘火表空/无值) -> 全量, 不用 update_time 作条件
     #     clauses.append("update_time > {}".format(_pg_literal(_fmt_ts(max_ut))))
     
     # if cursor_mc is not None:
@@ -486,7 +486,7 @@ def save_mainmaterial_basic_data(payload, user_id):
 def material_master_data_push(user_id=0):
     """物料主数据同步入口: 增量 + 分批查数仓 -> 组接口结构 -> 调 save 落库, 直到读不出数据。
 
-    增量: 只查 update_time > 烽火 t_mmd_material_basic_data 最大 update_time 的数据。
+    增量: 只查 update_time > 秘火 t_mmd_material_basic_data 最大 update_time 的数据。
     分批: 每批 BATCH_SIZE 条, 按 (update_time, mat_code) 游标续读。
 
     :param user_id: 创建/操作人 id, 透传给 maintain_data。
@@ -495,7 +495,7 @@ def material_master_data_push(user_id=0):
     db = DbHelper()
     pg = PostgreSQL()
 
-    max_ut = _get_max_update_time(db)          # 增量基线(烽火表空 -> None -> 全量)
+    max_ut = _get_max_update_time(db)          # 增量基线(秘火表空 -> None -> 全量)
     cursor_ut, cursor_mc = None, None           # 游标: 第一批不带上界
     total, batch_no = 0, 0
 
