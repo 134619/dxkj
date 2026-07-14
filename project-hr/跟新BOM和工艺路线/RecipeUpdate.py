@@ -214,8 +214,6 @@ def getDropDownList(type, condition, plant_code, work_center, **kwargs):
         return ResponseData(400, f"不支持的类型[{type}]", [])
 
 
-
-
 """
 根据表t_rgt_routing_operation中字段recipe_code从t_eq_recipe_activity_header找到N条数据，
 如果只找出了一条，就不做处理
@@ -399,6 +397,9 @@ def expand_routing_operation_by_work_center(plant_code, data, user_id):
 
     db = DbHelper()
     insert_list = []
+    writeback_list = (
+        []
+    )  # (routing_group, routing_group_serial_number): 复制成功后反写 remarks=X
 
     for item in data:
         routing_group = item.get("routing_group")
@@ -406,14 +407,23 @@ def expand_routing_operation_by_work_center(plant_code, data, user_id):
         if routing_group is None or routing_group_serial_number is None:
             continue
 
+        # 0. 先查 t_rgt_routing_header.remarks: ==X 表示该工序已复制过, 跳过; !=X 才执行复制
+        chk = db.query_sql(
+            f"""SELECT `remarks` FROM `t_rgt_routing_header`
+                WHERE `routing_group`='{routing_group}'
+                  AND `routing_group_serial_number`='{routing_group_serial_number}'
+                LIMIT 1 """,
+            isNewDB=True,
+        )
+        if chk and (chk[0].get("remarks") or "") == "X":
+            continue
+
         # 1. 按 routing_group + routing_group_serial_number 找工序(整行取出, 复制时改 work_center + 序号)
-        ops = db.query_sql(
-            f"""SELECT * FROM `t_rgt_routing_operation`
+        ops = db.query_sql(f"""SELECT * FROM `t_rgt_routing_operation`
                 WHERE `plant_code`='{plant_code}'
                   AND `routing_group`='{routing_group}'
                   AND `routing_group_serial_number`='{routing_group_serial_number}'
-                ORDER BY `item_no` ASC """
-        )
+                ORDER BY `item_no` ASC """)
         if not ops:
             continue
 
@@ -449,6 +459,9 @@ def expand_routing_operation_by_work_center(plant_code, data, user_id):
                 new_op["operation_number"] = max_op_no + seq
                 insert_list.append(new_op)
 
+        # 该 routing 复制流程已执行, 标记待反写 remarks=X(执行成功后统一回写)
+        writeback_list.append((routing_group, routing_group_serial_number))
+
     # 按 (recipe_code, work_center) 对 insert_list 去重: 不同工序命中相同 recipe_code 会产生重复组合, 只插一条
     seen = set()
     _deduped = []
@@ -464,10 +477,25 @@ def expand_routing_operation_by_work_center(plant_code, data, user_id):
     # 注: 该库不支持 INSERT ... ON DUPLICATE KEY UPDATE(报"无法在源表中获得一组稳定的行"),
     #     故不用 DuplicateSQLKey, 用普通 INSERT。
     if insert_list:
-        db.batchInsertToDB("t_rgt_routing_operation", insert_list, user_id=user_id, printSql=True)
+        db.batchInsertToDB(
+            "t_rgt_routing_operation", insert_list, user_id=user_id, printSql=True
+        )
         db.updateDBObj()
-        print(f"expand_routing_operation_by_work_center 新增工序行数: {len(insert_list)}")
+        print(
+            f"expand_routing_operation_by_work_center 新增工序行数: {len(insert_list)}"
+        )
 
+    # 执行工序成功后, 反写 remarks=X 到 t_rgt_routing_header(标记已复制, 下次跳过)
+    for rg, rgsn in writeback_list:
+        try:
+            db.exec_sql(
+                f"""UPDATE `t_rgt_routing_header` SET `remarks`='X'
+                    WHERE `routing_group`='{rg}' AND `routing_group_serial_number`='{rgsn}' """,
+                isNewDB=True,
+            )
+            db.updateDBObj()
+        except Exception as e:
+            print(f"[expand] 反写 remarks=X 失败 rg={rg} rgsn={rgsn}: {e}")
 
 
 @ResetResponse(params=["type", "plant_code", "routing_group", "routing_group_serial_number"],

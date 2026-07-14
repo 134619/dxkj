@@ -38,11 +38,13 @@ ST_PENDING = 1      # 待处理(已落 NC 台账)
 ST_SUBMIT_OK = 4    # 已提交平台成功(external_system_save 校验通过并落 t_external_sys_md_*)
 ST_VALID_FAIL = 6   # 校验失败(NC 必填缺失 / external 校验 msg 非空)
 
-# ==================== 接口控制列 → 复用预留字段 ====================
-COL_API_ID = "reserved9"  # uf_api_id       (两表共用: 幂等 / 关联 header↔item / 清理)
-COL_STATUS = "reserved1"  # document_status (仅 header: 状态机 1/3/4/6)
-COL_MESSAGE = "reserved2"  # message         (仅 header: 回写消息)
+# ==================== 返回前端 code ====================
+CODE_OK = 200             # 成功
+CODE_MISSING_PARAM = 401  # 缺少参数 / 校验失败
 
+# ==================== 接口控制列 → 复用预留字段 ====================
+COL_API_ID = "reserved9"  # uf_api_id (两表共用: 幂等 / 关联 header↔item / 清理)
+# header 另复用预留列(裸名直写): reserved1=document_status(状态机 1/4/6) / reserved2=message(回写消息)
 
 # ==================== 字段映射: NC 逻辑名 → 库列名 ====================
 HEADER_MAP = {
@@ -144,10 +146,10 @@ def _validate_item(it, idx):
 def _build_header_row(header, uf_api_id, now, status, msg):
     row = {
         COL_API_ID: uf_api_id,
-        COL_STATUS: status,
+        "reserved1": status,  # document_status
         "mat_doc_sn": _val(header, "mat_doc_sn"),
         "year": _val(header, "year"),
-        COL_MESSAGE: msg,
+        "reserved2": msg,  # message
         "create_time": now,
     }
     for logical, col in HEADER_MAP.items():
@@ -161,7 +163,7 @@ def _build_item_row(it, uf_api_id, now, header=None):
     row = {
         COL_API_ID: uf_api_id,
         "mat_doc_sn": "",
-        "pir_version": " ",  # Oracle 视空串为 NULL, 用单空格占位满足 NOT NULL
+        "pir_version": "测试1",  # Oracle 视空串为 NULL, 用单空格占位满足 NOT NULL
         "create_time": now,
     }
     for logical, col in ITEM_MAP.items():
@@ -231,10 +233,10 @@ def _writeback(uf_api_id, status, mat_doc_sn, year, message, db, user_id):
 
     now = _now()
     sets = [
-        "`{}`={}".format(COL_STATUS, status),
+        "`reserved1`={}".format(status),  # document_status
         "`mat_doc_sn`='{}'".format(_esc(mat_doc_sn)),
         "`year`='{}'".format(_esc(year)),
-        "`{}`='{}'".format(COL_MESSAGE, _esc((message or "")[:255])),
+        "`reserved2`='{}'".format(_esc((message or "")[:255])),  # message
         "`update_id`={}".format(int(user_id or 0)),
         "`update_time`='{}'".format(now),
     ]
@@ -249,12 +251,10 @@ def _writeback(uf_api_id, status, mat_doc_sn, year, message, db, user_id):
 def _check_duplicate(uf_api_id, db):
     """幂等: 该 uf_api_id 是否已过账成功, 返回 (exists, mat_doc_sn, year)"""
     rows = db.query_sql(
-        "SELECT `mat_doc_sn`,`year`,`{}` FROM `{}` "
-        "WHERE `{}`='{}' LIMIT 1".format(
-            COL_STATUS, T_HEADER, COL_API_ID, _esc(uf_api_id)
-        )
+        "SELECT `mat_doc_sn`,`year`,`reserved1` FROM `{}` "
+        "WHERE `{}`='{}' LIMIT 1".format(T_HEADER, COL_API_ID, _esc(uf_api_id))
     )
-    if rows and int(rows[0].get(COL_STATUS, 0) or 0) == ST_SUBMIT_OK:
+    if rows and int(rows[0].get("reserved1", 0) or 0) == ST_SUBMIT_OK:
         return True, rows[0].get("mat_doc_sn", ""), rows[0].get("year", "")
     return False, "", ""
 
@@ -274,9 +274,9 @@ def _build_external_doc_data(header, items, uf_api_id):
         "document_date": doc_date,
         "posting_date": _val(header, "posting_date"),
         "company_code": _val(header, "company_code"),
-        "reversal_mark": 0,                              # NC 无冲销语义, 默认 0
-        "external_sys_document_create_date": doc_date,   # 取凭证日期
-        "message_text": "",                              # 占位, 由 external_system_check 回填
+        "reversal_mark": 0,  # NC 无冲销语义, 默认 0
+        "external_sys_document_create_date": doc_date,  # 取凭证日期
+        "message_text": "",  # 占位, 由 external_system_check 回填
     }
     for f in ("exchange_rate", "summary_unique_number", "remarks_1", "remarks_2"):
         v = header.get(f)
@@ -291,6 +291,8 @@ def _build_external_doc_data(header, items, uf_api_id):
     # NC → 平台 字段名转换(po_sn/so_sn → rel_po_sn/rel_so_sn)
     rename = {"po_sn": "rel_po_sn", "po_items": "rel_po_items",
               "so_sn": "rel_so_sn", "so_items": "rel_so_items"}
+    # 平台要求 int 的 rename 目标(NC 常以零填充字符串 "00010" 传入, 需转 int)
+    rename_int = {"rel_po_items", "rel_so_items"}
 
     ext_items = []
     for it in items:
@@ -298,7 +300,9 @@ def _build_external_doc_data(header, items, uf_api_id):
         uom = _val(it, "transaction_uom")
         ext_it = {
             "external_sys_unique_doc_sn": uf_api_id,
-            "external_sys_unique_doc_items": it.get("line_id"),  # 平台唯一行号 ← line_id
+            "external_sys_unique_doc_items": it.get(
+                "line_id"
+            ),  # 平台唯一行号 ← line_id
             "line_id": it.get("line_id"),
             "movement_type": _val(it, "movement_type"),  # NC 行项目自带(映射逻辑已停用)
             "plant_code": _val(it, "plant_code"),
@@ -308,7 +312,12 @@ def _build_external_doc_data(header, items, uf_api_id):
             "transaction_uom": uom,
             "pricing_unit_quantity": qty,  # 兜底 ← 交易数量
             "pricing_unit_of_measure": uom,  # 兜底 ← 交易单位
+            "pir_version": " ",  # Oracle NOT NULL 占位(评估版本, NC 无此概念); 空串在 Oracle 即 NULL 会撞 ORA-01400
         }
+        # price(交易金额) ← transaction_amount: 平台要求 list 类型, 关联采购订单(rel_po_sn)存在时必填
+        amt = it.get("transaction_amount")
+        if amt is not None and amt != "":
+            ext_it["price"] = [amt]
         for f in opt_fields:
             v = it.get(f)
             if v is not None and v != "":
@@ -316,6 +325,11 @@ def _build_external_doc_data(header, items, uf_api_id):
         for src, dst in rename.items():
             v = it.get(src)
             if v is not None and v != "":
+                if dst in rename_int:
+                    try:
+                        v = int(v)
+                    except (TypeError, ValueError):
+                        pass  # 转不了 int 就原样传, 交给平台类型校验报错
                 ext_it[dst] = v
         ext_items.append(ext_it)
 
@@ -336,7 +350,7 @@ def material_receipt_receive(header=None, items=None, user_id=0, **extra):
     if isinstance(items, dict):
         items = [items]
     if not isinstance(items, list):
-        return {"type": "E", "message": "items 必须是列表", "status": ST_VALID_FAIL}
+        return {"type": "E", "code": CODE_MISSING_PARAM, "message": "items 必须是列表", "status": ST_VALID_FAIL}
 
     uf_api_id = _val(header, "uf_api_id")
     header["uf_api_id"] = uf_api_id
@@ -345,7 +359,7 @@ def material_receipt_receive(header=None, items=None, user_id=0, **extra):
     # 0. 幂等
     dup, md, yr = _check_duplicate(uf_api_id, db)
     if dup:
-        return {"type": "S", "message": "该单据已提交平台成功, 请勿重复推送",
+        return {"type": "S", "code": CODE_OK, "message": "该单据已提交平台成功, 请勿重复推送",
                 "uf_api_id": uf_api_id, "mat_doc_sn": md, "year": yr, "status": ST_SUBMIT_OK}
 
     # 1. 必填校验
@@ -355,7 +369,7 @@ def material_receipt_receive(header=None, items=None, user_id=0, **extra):
     if errs or not items:
         msg = ";".join(errs) or "无行项目数据"
         _persist(header, items, uf_api_id, now, ST_VALID_FAIL, msg, db, user_id)
-        return {"type": "E", "message": "校验失败: " + msg, "uf_api_id": uf_api_id, "status": ST_VALID_FAIL}
+        return {"type": "E", "code": CODE_MISSING_PARAM, "message": "校验失败: " + msg, "uf_api_id": uf_api_id, "status": ST_VALID_FAIL}
 
     # 2. 落库(状态=待处理)
     _persist(header, items, uf_api_id, now, ST_PENDING, "", db, user_id)
@@ -368,17 +382,19 @@ def material_receipt_receive(header=None, items=None, user_id=0, **extra):
 
     # 4. 转平台格式 + 调 external_system_save(平台做格式/必填校验并落 t_external_sys_md_*)
     doc_data = _build_external_doc_data(header, items, uf_api_id)
+
+    print("doc_data----", doc_data)
     all_count, pass_count, _items_data, msg = external_system_save(doc_data)
 
     # 5. 回写 NC 台账
     if msg:
         _writeback(uf_api_id, ST_VALID_FAIL, "", "", msg, db, user_id)
-        return {"type": "E", "message": "提交平台校验失败: " + msg,
+        return {"type": "E", "code": CODE_MISSING_PARAM, "message": "提交平台校验失败: " + msg,
                 "uf_api_id": uf_api_id, "status": ST_VALID_FAIL}
     note = "已提交平台" if pass_count >= all_count else \
         "已提交平台(部分行未通过校验: 成功{}/共{})".format(pass_count, all_count)
     _writeback(uf_api_id, ST_SUBMIT_OK, "", "", note, db, user_id)
-    return {"type": "S", "message": note, "uf_api_id": uf_api_id,
+    return {"type": "S", "code": CODE_OK, "message": note, "uf_api_id": uf_api_id,
             "all_count": all_count, "pass_count": pass_count, "status": ST_SUBMIT_OK}
 
 
@@ -482,7 +498,7 @@ def save_receive_material_document_flat(payload, user_id):
     """
     groups = _flat_to_groups(payload)
     if not groups:
-        return {"type": "E", "message": "无数据(data 为空)"}
+        return {"type": "E", "code": CODE_MISSING_PARAM, "message": "无数据(data 为空)"}
 
     results, errs = [], []
     total_rows = 0
@@ -494,9 +510,10 @@ def save_receive_material_document_flat(payload, user_id):
             errs.append("{}: {}".format(header["uf_api_id"], res.get("message", "")))
 
     if errs:
-        return {"type": "E", "message": "; ".join(errs)}
+        return {"type": "E", "code": CODE_MISSING_PARAM, "message": "; ".join(errs)}
     return {
         "type": "S",
+        "code": CODE_OK,
         "message": "成功: {} 张凭证 / {} 行".format(len(results), total_rows),
     }
 
@@ -509,12 +526,12 @@ if __name__ == "__main__":
             "year": "2026",
             "document_date": "2026-07-10",
             "posting_date": "2026-07-10",
-            "post_code": "1",
-            "company_code": "1000",
+            "post_code": "",
+            "company_code": "J0008",
             "document_type": "采购入库单",
             "business_type": "入库",
             "exchange_rate": "",
-            "summary_unique_number": "",
+            "summary_unique_number": "1",
             "remarks_1": "7月采购入库",
             "remarks_2": "",
             "vendor_dn": "",
@@ -525,10 +542,10 @@ if __name__ == "__main__":
                 "line_id": 1,
                 "erp_document_items": "0001",
                 "document_flag": "PK20260710001",
-                "plant_code": "1000",
+                "plant_code": "FSDA",
                 "stor_loc_code": "W001",
                 "batch_sn": "B2026071001",
-                "inventory_status": "非限制",
+                "inventory_status": "",
                 "special_inventory_status2": "",
                 "movement_type": "101",
                 "mat_code": "M000000001",
