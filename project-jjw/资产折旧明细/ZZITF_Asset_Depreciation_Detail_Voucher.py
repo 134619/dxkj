@@ -61,8 +61,12 @@ def _uf_row(row):
 
     其他人传入用的是逻辑字段名(fi_document_number 等), 库里业务列名是 uf_ 前缀;
     审计列(create_id/create_time 等)不加前缀。这里统一映射, 避免 batchInsertToDB 按实际列名匹配时静默丢字段。
+
+    note 列 NOT NULL: 调用方未传时给单空格占位(Oracle 空串即 NULL, 会撞 ORA-01400)。
     """
-    return {k if k in _AUDIT_COLS else "uf_" + str(k): v for k, v in row.items()}
+    out = {k if k in _AUDIT_COLS else "uf_" + str(k): v for k, v in row.items()}
+    out.setdefault("note", " ")
+    return out
 
 # ==================== 抬头固定值(调用方未传时回填的默认值) ====================
 FI_LEDGER = "YS0"                   # 财务核算分类帐

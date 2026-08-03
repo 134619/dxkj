@@ -6,20 +6,6 @@
 @Author  : yang.zhang@dxdstech.com
 @explain : 物料凭证(单据)接口: NC 推送物料凭证 → 落库 → 映射移动类型 → 转平台格式 →
             调 external_system_save → 回写
-
-    1 待处理 / 3 映射失败 / 4 已提交平台成功 / 6 校验失败
-  请求体示例:
-    {"data": {
-        "header": {"uf_api_id":"NC20260709001", "business_type":"入库",
-                   "document_type":"采购入库单", "document_date":"2026-07-09",
-                   "posting_date":"2026-07-09", "post_code":"1", "company_code":"1001"},
-        "items":  [{"line_id":1, "erp_document_items":"0001", "document_flag":"PK001",
-                    "plant_code":"1001", "stor_loc_code":"W01",
-                    "mat_code":"M0001", "batch_sn":"B001", "transaction_qty":100,
-                    "transaction_uom":"PC", "basic_uom":"PC",
-                    "po_sn":"4500000001", "po_items":10, "vendor_code":"V001",
-                    "transfer_warehouse_num":"TR001", "transfer_warehouse_items":"10"}]
-    }}
 """
 
 from datetime import datetime
@@ -32,6 +18,7 @@ from without_documents_posting_platform import external_system_save
 T_HEADER = "t_md_header"            # 物料凭证抬头表
 T_ITEM = "t_md_item"                # 物料凭证行项目表
 T_MAP = "ut_nc_doc_move_type_map"  # 映射表名常量(映射逻辑已停用, 仅留名供 dump_columns/后续恢复用)
+T_PRICE_DATA = "t_external_sys_md_price_data"  # 物料凭证价格数据表
 
 # ==================== 状态机 ====================
 ST_PENDING = 1      # 待处理(已落 NC 台账)
@@ -44,7 +31,9 @@ CODE_MISSING_PARAM = 401  # 缺少参数 / 校验失败
 
 # ==================== 接口控制列 → 复用预留字段 ====================
 COL_API_ID = "reserved9"  # uf_api_id (两表共用: 幂等 / 关联 header↔item / 清理)
-# header 另复用预留列(裸名直写): reserved1=document_status(状态机 1/4/6) / reserved2=message(回写消息)
+
+# ==================== 数据库默认值 ====================
+PRICE_CONDITION = "PR00"
 
 # ==================== 字段映射: NC 逻辑名 → 库列名 ====================
 HEADER_MAP = {
@@ -58,7 +47,6 @@ HEADER_MAP = {
     "remarks_2": "remarks_2",
     "vendor_dn": "vendor_dn",
 }
-
 
 ITEM_MAP = {
     "line_id": "line_id",
@@ -96,8 +84,17 @@ ITEM_MAP = {
     "document_type": "reserved10",  # 单据类型(抬头级, 落 item; 取值 item 优先 header 兜底)
 }
 
-# 行项目必填字段(NC 逻辑名)
-ITEM_REQUIRED = ["plant_code", "mat_code", "transaction_qty", "transaction_uom"]
+# 行项目必填字段(NC 逻辑名): 单据类型/ERP单据行号/来源单据PK标识/工厂/库存地点/物料/数量/单位
+ITEM_REQUIRED = [
+    "document_type",  # 单据类型(预留字段 reserved10; 行内未传取 header 兜底)
+    "erp_document_items",  # ERP单据行号(预留字段 reserved1)
+    # "document_flag",  # 来源单据PK标识(预留字段 reserved2)
+    "plant_code",  # 工厂代码
+    "stor_loc_code",  # 库存地点
+    "mat_code",  # 物料编码
+    "transaction_qty",  # 交易数量
+    "transaction_uom",  # 交易单位
+]
 
 
 # ==================== 基础工具 ====================
@@ -120,8 +117,18 @@ def _esc(v):
 
 # ==================== 校验 ====================
 def _validate_header(header):
-    """抬头轻量必填校验, 返回 [err, ...](空=通过)"""
+    """抬头必填校验, 返回 [err, ...](空=通过)。
+    必填: uf_api_id / mat_doc_sn / year / document_date / posting_date;
+    post_code 选填, 传则须为 1-7。
+    """
+
     errs = []
+    if _val(header, "uf_api_id") == "":
+        errs.append("接口ID(uf_api_id)必填")
+    if _val(header, "mat_doc_sn") == "":
+        errs.append("ERP单号(mat_doc_sn)必填")
+    if _val(header, "year") == "":
+        errs.append("凭证年度(year)必填")
     if _val(header, "document_date") == "":
         errs.append("凭证日期(document_date)必填")
     if _val(header, "posting_date") == "":
@@ -132,11 +139,15 @@ def _validate_header(header):
     return errs
 
 
-def _validate_item(it, idx):
-    """单行必填校验, 返回 [err, ...]"""
+def _validate_item(it, idx, header=None):
+    """单行必填校验, 返回 [err, ...]。
+    document_type 支持抬头级兜底: 行内未传则取 header(与 _build_item_row 同款逻辑)。
+    """
     errs = []
     for f in ITEM_REQUIRED:
         v = it.get(f) if isinstance(it, dict) else None
+        if (v is None or v == "") and f == "document_type" and header:
+            v = header.get("document_type")  # 抬头级兜底
         if v is None or v == "":
             errs.append("第{}行缺少必填字段 {}".format(idx + 1, f))
     return errs
@@ -162,10 +173,15 @@ def _build_header_row(header, uf_api_id, now, status, msg):
 def _build_item_row(it, uf_api_id, now, header=None):
     row = {
         COL_API_ID: uf_api_id,
-        "mat_doc_sn": "",
-        "pir_version": "测试1",  # Oracle 视空串为 NULL, 用单空格占位满足 NOT NULL
+        "mat_doc_sn": _val(header, "mat_doc_sn"),
+        "year": _val(header, "year"),
+        "pir_version": " ",  # Oracle 视空串为 NULL
         "create_time": now,
     }
+
+    mdi = _val(it, "erp_document_items")
+    if mdi != "":
+        row["mat_doc_items"] = mdi
     for logical, col in ITEM_MAP.items():
         v = it.get(logical)
         if (v is None or v == "") and logical == "document_type" and header:
@@ -194,12 +210,6 @@ def _persist(header, items, uf_api_id, now, status, msg, db, user_id):
 
 
 def _write_price_data(header, items, db, user_id):
-    """po_sn 不为空的行, 写入 t_external_sys_md_price_data(物料凭证价格数据):
-    external_sys_unique_doc_sn ← header.mat_doc_sn,
-    external_sys_unique_doc_items ← item.erp_document_items,
-    unit_price_excluding_tax ← item.transaction_amount。
-    无 mat_doc_sn 或该行无 po_sn 则跳过。
-    """
     mat_doc_sn = _val(header, "mat_doc_sn")
     if not mat_doc_sn:
         return  # 无 ERP 单号无法定位价格数据
@@ -214,16 +224,17 @@ def _write_price_data(header, items, db, user_id):
                 "external_sys_unique_doc_sn": mat_doc_sn,
                 "external_sys_unique_doc_items": it.get("erp_document_items"),
                 "unit_price_excluding_tax": it.get("transaction_amount"),
+                "price_condition": PRICE_CONDITION,
                 "create_time": _now(),
             }
         )
     if rows:
-        # 先删该单号的旧价格数据, 保证重推幂等(避免撞唯一索引 IDX_T_EXTERNAL_SYS_MD_PRICE_DATA_UNIQUE_INDEX)
-        db.exec_sql(
-            "DELETE FROM `t_external_sys_md_price_data`"
-            " WHERE `external_sys_unique_doc_sn`='{}'".format(_esc(mat_doc_sn))
+        db.batchInsertToDB(
+            T_PRICE_DATA,
+            rows,
+            user_id=user_id,
+            DuplicateSQLKey=["unit_price_excluding_tax"],
         )
-        db.batchInsertToDB("t_external_sys_md_price_data", rows, user_id=user_id)
         db.updateDBObj()
 
 
@@ -365,7 +376,7 @@ def material_receipt_receive(header=None, items=None, user_id=0, **extra):
     # 1. 必填校验
     errs = _validate_header(header)
     for idx, it in enumerate(items):
-        errs += _validate_item(it, idx)
+        errs += _validate_item(it, idx, header)
     if errs or not items:
         msg = ";".join(errs) or "无行项目数据"
         _persist(header, items, uf_api_id, now, ST_VALID_FAIL, msg, db, user_id)
@@ -430,9 +441,6 @@ def dump_columns(db=None):
             print("==== {} ====\n[获取列失败] {}".format(tbl, e))
 
 
-# ==================== 扁平式接收(ExtendHandler 体系: payload={guid, data:[...]}) ====================
-# 前端不分 header/items, 全部扁平放 data; 按 uf_api_id 聚合: 同号多条 = 一张凭证多行。
-# 抬头字段(HEADER_FIELDS)从组内首个非空提取, 其余字段作为行项目落 item, 复用 material_receipt_receive。
 HEADER_FIELDS = (
     "uf_api_id",
     "mat_doc_sn",
@@ -452,10 +460,10 @@ HEADER_FIELDS = (
 
 
 def _flat_to_groups(payload):
-    """扁平 payload → [(header, items), ...], 按 uf_api_id 聚合。
-    :param payload: {"guid":..., "data":[{抬头+行字段扁平}, ...]} 或直接 list[dict]
+    """扁平 payload
     :return [(header_dict, [row, ...]), ...]
     """
+
     data = payload.get("data") if isinstance(payload, dict) else payload
     if isinstance(data, dict):
         data = [data]
@@ -466,7 +474,12 @@ def _flat_to_groups(payload):
     for row in data:
         if not isinstance(row, dict):
             continue
+        # 幂等键: 优先 uf_api_id; NC 实际下发字段名为 uf_api_idc 时兜底(二者等价)。
+        # 必须取到非空值: 否则 reserved9 落空 → Oracle 视空串为 NULL → 去重清理 WHERE reserved9=''
+        # 匹配不到旧行 → 重推/同号会撞唯一索引 IDX_T_MD_ITEM_DOC(ORA-00001)
         aid = _val(row, "uf_api_id")
+        if aid == "":
+            aid = _val(row, "uf_api_idc")
         if aid not in groups:
             groups[aid] = []
             order.append(aid)
@@ -490,12 +503,12 @@ def _flat_to_groups(payload):
 
 def save_receive_material_document_flat(payload, user_id):
     """物料凭证(单据)接收接口(扁平式, ExtendHandler 体系)。
-    前端: {"interface_code":"ZMM_INT_040", "payload":{"guid":..., "data":[{扁平抬头+行字段}, ...]}}
     按 uf_api_id 聚合后复用 material_receipt_receive 落库 → external_system_save → 回写。
     :param payload: {"guid":..., "data":[...]}
     :param user_id: 操作人 id
     :return {"type":"S"/"E", "message":...}
     """
+
     groups = _flat_to_groups(payload)
     if not groups:
         return {"type": "E", "code": CODE_MISSING_PARAM, "message": "无数据(data 为空)"}
@@ -519,60 +532,32 @@ def save_receive_material_document_flat(payload, user_id):
 
 
 if __name__ == "__main__":
-    sample = {
-        "header": {
-            "uf_api_id": "NC20260710001",
-            "mat_doc_sn": "5000000001",
-            "year": "2026",
-            "document_date": "2026-07-10",
-            "posting_date": "2026-07-10",
-            "post_code": "",
+    sample = [
+        {
+            "vendor_code": "J00150",
+            "year": "2024",
+            "batch_sn": "J0008KEVIN1204",
+            "po_sn": "JJWDCD241100031",
+            "transaction_amount": 19500,
+            "dr": 0,
+            "mat_code": "J11020010001",
+            "business_type": "采购入库",
+            "transaction_qty": 16,
+            "basic_qty": 16,
             "company_code": "J0008",
-            "document_type": "采购入库单",
-            "business_type": "入库",
-            "exchange_rate": "",
-            "summary_unique_number": "1",
-            "remarks_1": "7月采购入库",
-            "remarks_2": "",
-            "vendor_dn": "",
-        },
-        "items": [
-            {
-                # 采购入库行: 采购订单 / 供应商 / 成本中心
-                "line_id": 1,
-                "erp_document_items": "0001",
-                "document_flag": "PK20260710001",
-                "plant_code": "FSDA",
-                "stor_loc_code": "W001",
-                "batch_sn": "B2026071001",
-                "inventory_status": "",
-                "special_inventory_status2": "",
-                "movement_type": "101",
-                "mat_code": "M000000001",
-                "transaction_qty": 100.000,
-                "transaction_uom": "PC",
-                "transaction_amount": 12000.00,
-                "basic_qty": 100.000,
-                "basic_uom": "PC",
-                "vendor_code": "V001000",
-                "customer_code": "",
-                "cost_center": "C00100",
-                "wbs_elements": "",
-                "po_sn": "4500000001",
-                "po_items": "00010",
-                "prodosn": "",
-                "so_sn": "",
-                "so_items": "",
-                "debit_credit_mark": "S",
-                "transfer_warehouse_num": "",
-                "transfer_warehouse_items": "",
-                "form_transfer_warehouse_num": "",
-                "form_transfer_warehouse_items": "",
-                "transfer_order_no": "",
-                "transfer_order_items": "",
-                "rcv_plant_code": "",
-                "rcv_stor_loc_code": "",
-            }
-        ],
-    }
-    print(material_receipt_receive(header=sample["header"], items=sample["items"], user_id=0))
+            "plant_code": "J0008",
+            "mat_doc_sn": "I2241100001",
+            "posting_date": "2024-11-12",
+            "document_type": "普通采购入库",
+            "uf_api_idc": "1001AA1000000011OZV4",
+            "document_date": "2024-11-12",
+            "stor_loc_code": "02",
+            "po_items": "20",
+            "cost_center": "J00080111",
+            "erp_document_items": "10",
+            "basic_uom": "001",
+            "ts": "2024-11-12 13:25:13",
+            "transaction_uom": "001",
+        }
+    ]
+    print(save_receive_material_document_flat({"data": sample}, user_id=0))
