@@ -147,10 +147,6 @@ class DynamicListValidator:
         self.results = []
         all_valid = True
 
-
-
-
-
         for idx, item in enumerate(data_list):
             if not isinstance(item, dict):
                 result = ValidationResult(
@@ -217,13 +213,13 @@ class DynamicListValidator:
         """单字段校验"""
         errors = []
         required_error = None
-        #可变必填校验处理
+        # 可变必填校验处理
         if rule.required_func:
 
             rule.required, required_error = rule.required_func(value,*tuple(
                 [full_data[i] for i in rule.required_func_depend] if rule.required_func_depend else []))
-        # 必填校验
-        if rule.required and not value:
+        # 必填校验(0/0.0/False 是合法值, 不能当空; 只有 None / 空串才算缺失)
+        if rule.required and (value is None or value == ""):
             errors.append(required_error or f"{field}是必填字段")
             return errors
 
@@ -496,11 +492,10 @@ class Cache_Class:
         # t_mmd_material_quality_Inspection_data
         self.MAT_QUALITY_FLAG = None
         self.DOC_STATUS_PASS = None
-        #no_supply_chain_document_flag
+        # no_supply_chain_document_flag
         self.NO_SUPPLY_FLAG_COMP = None
         self.EXTERNAL_MD_PRICE = None
         self.MAT_GROUP = None
-
 
     def get_mat_group(self):
         if self.MAT_GROUP is None:
@@ -508,8 +503,6 @@ class Cache_Class:
                 " select `mat_group` from `t_mmd_material_group` ")
             self.MAT_GROUP = [i['mat_group'] for i in tmp_data]
         return self.MAT_GROUP or []
-
-
 
     def get_md_price_data(self):
         if self.EXTERNAL_MD_PRICE is None:
@@ -540,7 +533,6 @@ class Cache_Class:
 
         return pass_flag, error_msg
 
-
     def get_no_supply_chain_document_flag(self):
         if self.NO_SUPPLY_FLAG_COMP is None:
             movement_type_data = self.db.query_sql(
@@ -548,7 +540,6 @@ class Cache_Class:
 
             self.NO_SUPPLY_FLAG_COMP = [i['company_code'] for i in movement_type_data]
         return self.NO_SUPPLY_FLAG_COMP or []
-
 
     def get_movement_type(self):
         if not self.MOVEMENT_TYPE:
@@ -695,7 +686,7 @@ class Cache_Class:
 
     def check_mat_code(self, value, *args):
 
-        #get_mat_code
+        # get_mat_code
         tmp_data = self.get_mat_code()
         pass_flag = True
         if value and value not in tmp_data.keys():
@@ -787,55 +778,54 @@ class Cache_Class:
         error_msg = f'过账代码为{movement_info.get(args[0], [None, None])[-1]} pur_item_cat {value} 不在系统中'
         return pass_flag, error_msg
 
-
     def check_price_bt(self, value, *args):
-
         rel_po_sn = args[0]
-        error_msg = f'关联采购订单存在 价格数据必需存在'
+        error_msg = f"关联采购订单存在 价格数据必需存在"
         if rel_po_sn:
             required = True
         else:
             required = False
 
-
         return required, error_msg
-
 
     def check_pur_item_cat_bt(self, value, *args):
         movement_info = self.get_movement_type()
-        if movement_info.get(args[0], [None, None])[-1] in ['1', '7']:
+        if movement_info.get(args[0], [None, None])[-1] in ["1", "7"]:
             required = True
         else:
             required = False
-        error_msg = f'过账代码为{movement_info.get(args[0], [None, None])[-1]} pur_item_cat 必填'
+        error_msg = f"过账代码为{movement_info.get(args[0], [None, None])[-1]} pur_item_cat 必填"
         return required, error_msg
+
     def check_account_allocation_category_bt(self, value, *args):
         movement_info = self.get_movement_type()
-        if movement_info.get(args[0], [None, None])[-1] in ['1', '7']:
+        if movement_info.get(args[0], [None, None])[-1] in ["1", "7"]:
             required = True
         else:
             required = False
-        error_msg = f'过账代码为{movement_info.get(args[0], [None, None])[-1]} account_allocation_category 必填'
+        error_msg = f"过账代码为{movement_info.get(args[0], [None, None])[-1]} account_allocation_category 必填"
         return required, error_msg
+
     # 过账代码为1或7时，需要填写
     # 直接写入，校验在t_ao_account_assignment_category - account_allocation_category是否存在
     def get_account_allocation_category(self):
         if not self.ACC_ALLOC_CAT:
             query_data = self.db.query_sql(
-                " select `account_allocation_category` from `t_ao_account_assignment_category`")
-            self.ACC_ALLOC_CAT = [i['account_allocation_category'] for i in query_data]
+                " select `account_allocation_category` from `t_ao_account_assignment_category`"
+            )
+            self.ACC_ALLOC_CAT = [i["account_allocation_category"] for i in query_data]
         return self.ACC_ALLOC_CAT or []
 
     def check_account_allocation_category(self, value, *args):
         movement_info = self.get_movement_type()
-        if movement_info.get(args[0], [None, None])[-1] in ['1', '7'] and value:
+        if movement_info.get(args[0], [None, None])[-1] in ["1", "7"] and value:
             tmp_data = self.get_account_allocation_category()
             pass_flag = False
             if value in tmp_data:
                 pass_flag = True
         else:
             pass_flag = True
-        error_msg = f'过账代码为{movement_info.get(args[0], [None, None])[-1]} account_allocation_category {value} 不在系统中'
+        error_msg = f"过账代码为{movement_info.get(args[0], [None, None])[-1]} account_allocation_category {value} 不在系统中"
         return pass_flag, error_msg
 
 
@@ -844,24 +834,26 @@ def external_system_save(doc_data):
     # 外部系统数据传入并存储
     db = DbHelper()
 
-    all_count, pass_count, insert_header_data, insert_items_data, items_data, msg = external_system_check(doc_data,
-                                                                                                          db=db)
+    all_count, pass_count, insert_header_data, insert_items_data, items_data, msg = (
+        external_system_check(doc_data, db=db)
+    )
 
     if not msg:
-        external_sys_unique_doc_sn_ls = [i['external_sys_unique_doc_sn'] for i in insert_header_data]
+        external_sys_unique_doc_sn_ls = [
+            i["external_sys_unique_doc_sn"] for i in insert_header_data
+        ]
         db.exec_sql("""
         DELETE FROM `t_external_sys_md_header` WHERE `external_sys_unique_doc_sn` in ({})
 
-        """.format(','.join([repr(i) for i in external_sys_unique_doc_sn_ls])))
+        """.format(",".join([repr(i) for i in external_sys_unique_doc_sn_ls])))
 
         db.exec_sql("""
         DELETE FROM `t_external_sys_md_item` WHERE `external_sys_unique_doc_sn` in ({})
-        """.format(','.join([repr(i) for i in external_sys_unique_doc_sn_ls])))
+        """.format(",".join([repr(i) for i in external_sys_unique_doc_sn_ls])))
 
-        db.batchInsertToDB('t_external_sys_md_header', insert_header_data)
-        db.batchInsertToDB('t_external_sys_md_item', insert_items_data)
+        db.batchInsertToDB("t_external_sys_md_header", insert_header_data)
+        db.batchInsertToDB("t_external_sys_md_item", insert_items_data)
     return all_count, pass_count, items_data, msg
-    #
 
 
 def external_system_check(doc_data, db=None):
@@ -869,941 +861,1232 @@ def external_system_check(doc_data, db=None):
         db = DbHelper()
     cache_cls = Cache_Class(db=db)
     header_rules = [
-        ValidationRule(field="external_sys_unique_doc_sn", required=True, field_type=str, length=LengthValidation(
-            enabled=True,
-            operator=LengthOperator.LE,
-            value=50,
-            error_msg="外部系统唯一凭证号长度不可大于50"
+        ValidationRule(
+            field="external_sys_unique_doc_sn",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=50,
+                error_msg="外部系统唯一凭证号长度不可大于50",
+            ),
+            custom_validator=cache_cls.check_document_status,
         ),
-                       custom_validator=cache_cls.check_document_status,
-                       ),
         ValidationRule(field="exchange_rate", required=False, field_type=float),
-        ValidationRule(field="document_date", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=10,
-                           error_msg="凭证日期格式错误"
-                       )),
-        ValidationRule(field="posting_date", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=10,
-                           error_msg="过账日期格式错误"
-                       )),
-        ValidationRule(field="reversal_mark", required=True, field_type=int,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=1,
-                           error_msg="reversal_mark 请传入 0/1",
-
-                       ),
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1],
-                       threshold_enabled_msg="{}请输入0/1".format('reversal_mark')
-                       ),
-        ValidationRule(field="company_code", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="公司代码长度超过6"
-                       ),
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=cache_cls.get_no_supply_chain_document_flag(),
-                       threshold_enabled_msg="{} 无供应链单据标识不为1 请检查".format('公司代码')
-                       ),
-        ValidationRule(field="summary_unique_number", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=64,
-                           error_msg="summary_unique_number长度超过64"
-                       )),
-        ValidationRule(field="vendor_dn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('vendor_dn', 20)
-                       )),
-        ValidationRule(field="remarks_1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('remarks_1', 20)
-                       )),
-        ValidationRule(field="remarks_2", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('remarks_2', 20)
-                       )),
-        ValidationRule(field="reserved1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reserved1', 255)
-                       )),
-        ValidationRule(field="reserved2", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reserved2', 255)
-                       )),
-        ValidationRule(field="reserved3", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reserved3', 255)
-                       )),
-        ValidationRule(field="reserved4", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved4', 30)
-                       )),
-        ValidationRule(field="reserved5", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved5', 30)
-                       )),
-        ValidationRule(field="reserved6", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved6', 30)
-                       )),
-        ValidationRule(field="reserved7", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved7', 30)
-                       )),
-        ValidationRule(field="reserved8", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved8', 30)
-                       )),
-        ValidationRule(field="reserved9", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved9', 30)
-                       )),
-        ValidationRule(field="reserved10", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved10', 30)
-                       )),
-        ValidationRule(field="reversal_reason", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('reversal_reason', 32)
-                       )),
-        ValidationRule(field="reversal_remark", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reversal_remark', 255)
-                       )),
-        ValidationRule(field="external_sys_document_create_date", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=10,
-                           error_msg="{}格式不正确".format('external_sys_document_create_date')
-                       ))
+        ValidationRule(
+            field="document_date",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=10,
+                error_msg="凭证日期格式错误",
+            ),
+        ),
+        ValidationRule(
+            field="posting_date",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=10,
+                error_msg="过账日期格式错误",
+            ),
+        ),
+        ValidationRule(
+            field="reversal_mark",
+            required=True,
+            field_type=int,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=1,
+                error_msg="reversal_mark 请传入 0/1",
+            ),
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="{}请输入0/1".format("reversal_mark"),
+        ),
+        ValidationRule(
+            field="company_code",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="公司代码长度超过6",
+            ),
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=cache_cls.get_no_supply_chain_document_flag(),
+            threshold_enabled_msg="{} 无供应链单据标识不为1 请检查".format("公司代码"),
+        ),
+        ValidationRule(
+            field="summary_unique_number",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=64,
+                error_msg="summary_unique_number长度超过64",
+            ),
+        ),
+        ValidationRule(
+            field="vendor_dn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("vendor_dn", 20),
+            ),
+        ),
+        ValidationRule(
+            field="remarks_1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("remarks_1", 20),
+            ),
+        ),
+        ValidationRule(
+            field="remarks_2",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("remarks_2", 20),
+            ),
+        ),
+        ValidationRule(
+            field="reserved1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reserved1", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reserved2",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reserved2", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reserved3",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reserved3", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reserved4",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved4", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved5",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved5", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved6",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved6", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved7",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved7", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved8",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved8", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved9",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved9", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved10",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved10", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reversal_reason",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("reversal_reason", 32),
+            ),
+        ),
+        ValidationRule(
+            field="reversal_remark",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reversal_remark", 255),
+            ),
+        ),
+        ValidationRule(
+            field="external_sys_document_create_date",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=10,
+                error_msg="{}格式不正确".format("external_sys_document_create_date"),
+            ),
+        ),
     ]
     item_rules = [
-
-        ValidationRule(field="external_sys_unique_doc_sn", required=True, field_type=str, length=LengthValidation(
-            enabled=True,
-            operator=LengthOperator.LE,
-            value=50,
-            error_msg="外部系统唯一凭证号长度不可大于50"
+        ValidationRule(
+            field="external_sys_unique_doc_sn",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=50,
+                error_msg="外部系统唯一凭证号长度不可大于50",
+            ),
         ),
-                       ),
-        ValidationRule(field="external_sys_unique_doc_items", required=True, field_type=int),
+        ValidationRule(
+            field="external_sys_unique_doc_items", required=True, field_type=int
+        ),
         ValidationRule(field="line_id", required=True, field_type=int),
         ValidationRule(field="parent_id", required=False, field_type=int),
-
-        ValidationRule(field="quality_insp_post_mark", required=False, field_type=int,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=1,
-                           error_msg="quality_insp_post_mark 请输入 0/1"
-                       ),
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1],
-                       threshold_enabled_msg="{}请输入0/1".format('quality_insp_post_mark')
-                       ),
-
-        ValidationRule(field="rev_doc_year", required=False, field_type=int,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=4,
-                           error_msg="rev_doc_year 长度为 4"
-                       )),
-        ValidationRule(field="rev_doc_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rev_doc_sn', 18)
-                       )),
-        ValidationRule(field="rev_doc_items", required=False, field_type=int,
-                       ),
-
-        ValidationRule(field="movement_type", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('movement_type', 6)
-                       )
-                       ),
-        ValidationRule(field="plant_code", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('plant_code', 6)
-                       )
-                       ),
-        ValidationRule(field="company_code", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('company_code', 6)
-                       )
-                       ),
-
-        ValidationRule(field="stor_loc_code", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=50,
-                           error_msg="{}长度超过{}".format('stor_loc_code', 50)
-                       )
-                       ),
-
-        ValidationRule(field="special_inventory_status1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('special_inventory_status1', 2)
-                       )
-                       # 在t_special_inventory_status-special_inventory_status表中是否存在
-                       ),
-
-        ValidationRule(field="special_inventory_status2", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('special_inventory_status2', 2)
-                       )
-                       ),
-
-        ValidationRule(field="inventory_status", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('inventory_status', 4)
-                       )
-                       ),
-        ValidationRule(field="mat_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=40,
-                           error_msg="{}长度超过{}".format('mat_code', 40)
-                       )
-                       # t_mmd_material_basic_data-mat_code
-                       ),
-
-        ValidationRule(field="mat_group", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('mat_group', 6)
-                       )
-                       # t_mmd_material_basic_data-mat_code
-                       ),
-
-        ValidationRule(field="batch_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=40,
-                           error_msg="{}长度超过{}".format('mat_code', 40)
-                       )
-                       # 根据物料编码+工厂代码+库存地点+批次号在t_inventory_batch_data表中是否存在
-                       ),
-
-        ValidationRule(field="transaction_qty", required=True, field_type=float
-                       ),
-
-        ValidationRule(field="transaction_uom", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=4,
-                           error_msg="{}长度超过{}".format('transaction_uom', 4)
-                       )
-                       ),
-        ValidationRule(field="basic_qty", required=False, field_type=float
-                       ),
-        ValidationRule(field="basic_uom", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=4,
-                           error_msg="{}长度超过{}".format('basic_uom', 4)
-                       )
-                       ),
-
+        ValidationRule(
+            field="quality_insp_post_mark",
+            required=False,
+            field_type=int,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=1,
+                error_msg="quality_insp_post_mark 请输入 0/1",
+            ),
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="{}请输入0/1".format("quality_insp_post_mark"),
+        ),
+        ValidationRule(
+            field="rev_doc_year",
+            required=False,
+            field_type=int,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=4,
+                error_msg="rev_doc_year 长度为 4",
+            ),
+        ),
+        ValidationRule(
+            field="rev_doc_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rev_doc_sn", 18),
+            ),
+        ),
+        ValidationRule(
+            field="rev_doc_items",
+            required=False,
+            field_type=int,
+        ),
+        ValidationRule(
+            field="movement_type",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("movement_type", 6),
+            ),
+        ),
+        ValidationRule(
+            field="plant_code",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("plant_code", 6),
+            ),
+        ),
+        ValidationRule(
+            field="company_code",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("company_code", 6),
+            ),
+        ),
+        ValidationRule(
+            field="stor_loc_code",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=50,
+                error_msg="{}长度超过{}".format("stor_loc_code", 50),
+            ),
+        ),
+        ValidationRule(
+            field="special_inventory_status1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("special_inventory_status1", 2),
+            ),
+            # 在t_special_inventory_status-special_inventory_status表中是否存在
+        ),
+        ValidationRule(
+            field="special_inventory_status2",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("special_inventory_status2", 2),
+            ),
+        ),
+        ValidationRule(
+            field="inventory_status",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("inventory_status", 4),
+            ),
+        ),
+        ValidationRule(
+            field="mat_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=40,
+                error_msg="{}长度超过{}".format("mat_code", 40),
+            ),
+            # t_mmd_material_basic_data-mat_code
+        ),
+        ValidationRule(
+            field="mat_group",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("mat_group", 6),
+            ),
+            # t_mmd_material_basic_data-mat_code
+        ),
+        ValidationRule(
+            field="batch_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=40,
+                error_msg="{}长度超过{}".format("mat_code", 40),
+            ),
+            # 根据物料编码+工厂代码+库存地点+批次号在t_inventory_batch_data表中是否存在
+        ),
+        ValidationRule(field="transaction_qty", required=True, field_type=float),
+        ValidationRule(
+            field="transaction_uom",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=4,
+                error_msg="{}长度超过{}".format("transaction_uom", 4),
+            ),
+        ),
+        ValidationRule(field="basic_qty", required=False, field_type=float),
+        ValidationRule(
+            field="basic_uom",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=4,
+                error_msg="{}长度超过{}".format("basic_uom", 4),
+            ),
+        ),
         ValidationRule(field="parallel_qty", required=False, field_type=float),
         ValidationRule(field="pricing_unit_quantity", required=True, field_type=float),
-
-        ValidationRule(field="pricing_unit_of_measure", required=True, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=4,
-                           error_msg="{}长度超过{}".format('pricing_unit_of_measure', 4)
-                       )
-
-                       ),
-
-        ValidationRule(field="transaction_amount", required=False, field_type=float
-                       ),
-        ValidationRule(field="transaction_currency", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=3,
-                           error_msg="{}长度超过{}".format('transaction_currency', 3)
-                       ),
-                       default_value_func=cache_cls.get_basic_currency_daf,
-                       depend_str='company_code'
-                       # 若未传值，则默认根据公司代码取本位币os_company-basic_currency
-
-                       ),
-
-        ValidationRule(field="rel_po_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rel_po_sn', 18)
-                       )
-                       ),
-        ValidationRule(field="rel_po_items", required=False, field_type=int,
-                       ),
+        ValidationRule(
+            field="pricing_unit_of_measure",
+            required=True,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=4,
+                error_msg="{}长度超过{}".format("pricing_unit_of_measure", 4),
+            ),
+        ),
+        ValidationRule(field="transaction_amount", required=False, field_type=float),
+        ValidationRule(
+            field="transaction_currency",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=3,
+                error_msg="{}长度超过{}".format("transaction_currency", 3),
+            ),
+            default_value_func=cache_cls.get_basic_currency_daf,
+            depend_str="company_code",
+            # 若未传值，则默认根据公司代码取本位币os_company-basic_currency
+        ),
+        ValidationRule(
+            field="rel_po_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rel_po_sn", 18),
+            ),
+        ),
+        ValidationRule(
+            field="rel_po_items",
+            required=False,
+            field_type=int,
+        ),
         ValidationRule(field="rel_po_component_number", required=False, field_type=int),
         ValidationRule(field="rel_po_comp_batch_num", required=False, field_type=int),
-
-        ValidationRule(field="receipt_completed_flag", required=False, field_type=int,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=1,
-                           error_msg="{}请输入0/1".format('receipt_completed_flag')
-                       ),
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1],
-                       threshold_enabled_msg="{}请输入0/1".format('receipt_completed_flag')
-                       ),
-
-        ValidationRule(field="batch_closure_flag", required=False, field_type=int,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=1,
-                           error_msg="{}请输入0/1".format('batch_closure_flag')
-                       ),
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1],
-                       threshold_enabled_msg="{}请输入0/1".format('batch_closure_flag')
-                       ),
-
-        ValidationRule(field="batch_closure_date", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.EQ,
-                           value=10,
-                           error_msg="{}输入 日期格式YYYY-mm-dd".format('batch_closure_date')
-                       )
-                       ),
-        ValidationRule(field="prodosn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('prodosn', 32)
-                       )
-                       ),
-        ValidationRule(field="prodo_component_number", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('prodo_component_number', 6)
-                       )
-                       ),
-        ValidationRule(field="rel_dn_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rel_dn_sn', 18)
-                       )
-                       ),
+        ValidationRule(
+            field="receipt_completed_flag",
+            required=False,
+            field_type=int,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=1,
+                error_msg="{}请输入0/1".format("receipt_completed_flag"),
+            ),
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="{}请输入0/1".format("receipt_completed_flag"),
+        ),
+        ValidationRule(
+            field="batch_closure_flag",
+            required=False,
+            field_type=int,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=1,
+                error_msg="{}请输入0/1".format("batch_closure_flag"),
+            ),
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="{}请输入0/1".format("batch_closure_flag"),
+        ),
+        ValidationRule(
+            field="batch_closure_date",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.EQ,
+                value=10,
+                error_msg="{}输入 日期格式YYYY-mm-dd".format("batch_closure_date"),
+            ),
+        ),
+        ValidationRule(
+            field="prodosn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("prodosn", 32),
+            ),
+        ),
+        ValidationRule(
+            field="prodo_component_number",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("prodo_component_number", 6),
+            ),
+        ),
+        ValidationRule(
+            field="rel_dn_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rel_dn_sn", 18),
+            ),
+        ),
         ValidationRule(field="rel_dn_item", required=False, field_type=int),
-
-        ValidationRule(field="rel_procure_dn_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rel_procure_dn_sn', 18)
-                       )
-                       ),
-        ValidationRule(field="rel_procure_dn_item", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="pod_related", required=False, field_type=int,
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1]
-                       , threshold_enabled_msg='pod_related 请输入 0/1'
-
-                       ),
-
-        ValidationRule(field="ro_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('ro_sn', 18)
-                       )
-                       ),
-        ValidationRule(field="ro_items", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="inv_transfer_order_no", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=40,
-                           error_msg="{}长度超过{}".format('inv_transfer_order_no', 40)
-                       )
-                       ),
-        ValidationRule(field="inv_transfer_order_items", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="rel_so_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rel_so_sn', 18)
-                       )
-                       ),
-        ValidationRule(field="rel_so_items", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="po_vendor", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('po_vendor', 20)
-                       )
-                       ),
-        ValidationRule(field="associated_customer", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('associated_customer', 20)
-                       )
-                       ),
-        ValidationRule(field="customer_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('customer_code', 20)
-                       )
-                       ),
-        ValidationRule(field="so_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('so_sn', 18)
-                       )
-                       ),
-        ValidationRule(field="so_items", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="project_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('project_sn', 32)
-                       )
-                       ),
-        ValidationRule(field="vendor_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('vendor_code', 20)
-                       )
-                       ),
-        ValidationRule(field="po_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('po_sn', 18)
-                       )
-                       ),
-
-        ValidationRule(field="po_items", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="wbs_elements", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('wbs_elements', 32)
-                       )
-                       ),
-        ValidationRule(field="cost_center", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('cost_center', 18)
-                       )
-                       ),
-        ValidationRule(field="cost_business_object", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('cost_business_object', 32)
-                       )
-                       ),
-
-        ValidationRule(field="cost_business_object1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('cost_business_object1', 32)
-                       )
-                       ),
-        ValidationRule(field="profit_center", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=12,
-                           error_msg="{}长度超过{}".format('profit_center', 12)
-                       )
-                       ),
-        ValidationRule(field="accounting_subjects", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('accounting_subjects', 20)
-                       )
-                       ),
-        ValidationRule(field="asset_code1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=12,
-                           error_msg="{}长度超过{}".format('asset_code1', 12)
-                       )
-                       ),
-        ValidationRule(field="asset_code2", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=4,
-                           error_msg="{}长度超过{}".format('asset_code2', 4)
-                       )
-                       ),
-        ValidationRule(field="movement_reason", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('movement_reason', 6)
-                       )
-                       ),
-        ValidationRule(field="equipment_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=50,
-                           error_msg="{}长度超过{}".format('equipment_code', 50)
-                       )
-                       ),
-
-        ValidationRule(field="express_delivery", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=50,
-                           error_msg="{}长度超过{}".format('express_delivery', 50)
-                       )
-                       ),
-        ValidationRule(field="pur_item_cat", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('pur_item_cat', 2)
-                       )
-                       ),
-
-        ValidationRule(field="account_allocation_category", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('account_allocation_category', 2)
-                       )
-                       ),
-
-        ValidationRule(field="po_qty", required=False, field_type=float
-                       ),
-
-        ValidationRule(field="pur_uom", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=4,
-                           error_msg="{}长度超过{}".format('pur_uom', 4)
-                       )
-                       ),
-
-        ValidationRule(field="free_mark", required=False, field_type=int,
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1]
-                       , threshold_enabled_msg='free_mark 请输入 0/1'
-                       ),
-        ValidationRule(field="rework_mark", required=False, field_type=int,
-                       threshold_enabled=True, operator=CompareOperator.IN,
-                       allowed_values=[0, 1]
-                       , threshold_enabled_msg='rework_mark 请输入 0/1'
-                       ),
-
-        ValidationRule(field="rework_type", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('rework_type', 2)
-                       )
-                       ),
-
+        ValidationRule(
+            field="rel_procure_dn_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rel_procure_dn_sn", 18),
+            ),
+        ),
+        ValidationRule(field="rel_procure_dn_item", required=False, field_type=int),
+        ValidationRule(
+            field="pod_related",
+            required=False,
+            field_type=int,
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="pod_related 请输入 0/1",
+        ),
+        ValidationRule(
+            field="ro_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("ro_sn", 18),
+            ),
+        ),
+        ValidationRule(field="ro_items", required=False, field_type=int),
+        ValidationRule(
+            field="inv_transfer_order_no",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=40,
+                error_msg="{}长度超过{}".format("inv_transfer_order_no", 40),
+            ),
+        ),
+        ValidationRule(
+            field="inv_transfer_order_items", required=False, field_type=int
+        ),
+        ValidationRule(
+            field="rel_so_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rel_so_sn", 18),
+            ),
+        ),
+        ValidationRule(field="rel_so_items", required=False, field_type=int),
+        ValidationRule(
+            field="po_vendor",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("po_vendor", 20),
+            ),
+        ),
+        ValidationRule(
+            field="associated_customer",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("associated_customer", 20),
+            ),
+        ),
+        ValidationRule(
+            field="customer_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("customer_code", 20),
+            ),
+        ),
+        ValidationRule(
+            field="so_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("so_sn", 18),
+            ),
+        ),
+        ValidationRule(field="so_items", required=False, field_type=int),
+        ValidationRule(
+            field="project_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("project_sn", 32),
+            ),
+        ),
+        ValidationRule(
+            field="vendor_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("vendor_code", 20),
+            ),
+        ),
+        ValidationRule(
+            field="po_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("po_sn", 18),
+            ),
+        ),
+        ValidationRule(field="po_items", required=False, field_type=int),
+        ValidationRule(
+            field="wbs_elements",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("wbs_elements", 32),
+            ),
+        ),
+        ValidationRule(
+            field="cost_center",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("cost_center", 18),
+            ),
+        ),
+        ValidationRule(
+            field="cost_business_object",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("cost_business_object", 32),
+            ),
+        ),
+        ValidationRule(
+            field="cost_business_object1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("cost_business_object1", 32),
+            ),
+        ),
+        ValidationRule(
+            field="profit_center",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=12,
+                error_msg="{}长度超过{}".format("profit_center", 12),
+            ),
+        ),
+        ValidationRule(
+            field="accounting_subjects",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("accounting_subjects", 20),
+            ),
+        ),
+        ValidationRule(
+            field="asset_code1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=12,
+                error_msg="{}长度超过{}".format("asset_code1", 12),
+            ),
+        ),
+        ValidationRule(
+            field="asset_code2",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=4,
+                error_msg="{}长度超过{}".format("asset_code2", 4),
+            ),
+        ),
+        ValidationRule(
+            field="movement_reason",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("movement_reason", 6),
+            ),
+        ),
+        ValidationRule(
+            field="equipment_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=50,
+                error_msg="{}长度超过{}".format("equipment_code", 50),
+            ),
+        ),
+        ValidationRule(
+            field="express_delivery",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=50,
+                error_msg="{}长度超过{}".format("express_delivery", 50),
+            ),
+        ),
+        ValidationRule(
+            field="pur_item_cat",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("pur_item_cat", 2),
+            ),
+        ),
+        ValidationRule(
+            field="account_allocation_category",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("account_allocation_category", 2),
+            ),
+        ),
+        ValidationRule(field="po_qty", required=False, field_type=float),
+        ValidationRule(
+            field="pur_uom",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=4,
+                error_msg="{}长度超过{}".format("pur_uom", 4),
+            ),
+        ),
+        ValidationRule(
+            field="free_mark",
+            required=False,
+            field_type=int,
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="free_mark 请输入 0/1",
+        ),
+        ValidationRule(
+            field="rework_mark",
+            required=False,
+            field_type=int,
+            threshold_enabled=True,
+            operator=CompareOperator.IN,
+            allowed_values=[0, 1],
+            threshold_enabled_msg="rework_mark 请输入 0/1",
+        ),
+        ValidationRule(
+            field="rework_type",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("rework_type", 2),
+            ),
+        ),
         # --    `rework_type`  VARCHAR(2) NOT NULL DEFAULT '' COMMENT '加工工序',
-
-        ValidationRule(field="reference1_item", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reference1_item', 255)
-                       )
-                       ),
-
-        ValidationRule(field="reference2_item", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reference2_item', 255)
-                       )
-                       ),
-
-        ValidationRule(field="reference3_item", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reference3_item', 255)
-                       )
-                       ),
-        ValidationRule(field="summary_line", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="rcv_plant_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=6,
-                           error_msg="{}长度超过{}".format('rcv_plant_code', 6)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_stor_loc_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=50,
-                           error_msg="{}长度超过{}".format('rcv_stor_loc_code', 50)
-                       )
-                       ),
-        ValidationRule(field="rcv_special_inventory_status1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('rcv_special_inventory_status1', 2)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_special_inventory_status2", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=2,
-                           error_msg="{}长度超过{}".format('rcv_special_inventory_status2', 2)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_inventory_status", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=4,
-                           error_msg="{}长度超过{}".format('rcv_inventory_status', 4)
-                       ),
-                       default_value_func=cache_cls.get_inventory_status_daf,
-                       depend_str='movement_type'
-                       ),
-
-        ValidationRule(field="rcv_mat_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=40,
-                           error_msg="{}长度超过{}".format('rcv_mat_code', 40)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_batch_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('rcv_batch_sn', 32)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_customer_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('rcv_customer_code', 20)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_so_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('rcv_so_sn', 20)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_so_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rcv_so_sn', 18)
-                       )
-                       ),
+        ValidationRule(
+            field="reference1_item",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reference1_item", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reference2_item",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reference2_item", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reference3_item",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reference3_item", 255),
+            ),
+        ),
+        ValidationRule(field="summary_line", required=False, field_type=int),
+        ValidationRule(
+            field="rcv_plant_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=6,
+                error_msg="{}长度超过{}".format("rcv_plant_code", 6),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_stor_loc_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=50,
+                error_msg="{}长度超过{}".format("rcv_stor_loc_code", 50),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_special_inventory_status1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("rcv_special_inventory_status1", 2),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_special_inventory_status2",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=2,
+                error_msg="{}长度超过{}".format("rcv_special_inventory_status2", 2),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_inventory_status",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=4,
+                error_msg="{}长度超过{}".format("rcv_inventory_status", 4),
+            ),
+            default_value_func=cache_cls.get_inventory_status_daf,
+            depend_str="movement_type",
+        ),
+        ValidationRule(
+            field="rcv_mat_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=40,
+                error_msg="{}长度超过{}".format("rcv_mat_code", 40),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_batch_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("rcv_batch_sn", 32),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_customer_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("rcv_customer_code", 20),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_so_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("rcv_so_sn", 20),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_so_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rcv_so_sn", 18),
+            ),
+        ),
         ValidationRule(field="rcv_so_items", required=False, field_type=int),
-
-        ValidationRule(field="rcv_project_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=32,
-                           error_msg="{}长度超过{}".format('rcv_project_sn', 32)
-                       )
-                       ),
-        ValidationRule(field="rcv_vendor_code", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=20,
-                           error_msg="{}长度超过{}".format('rcv_vendor_code', 20)
-                       )
-                       ),
-        ValidationRule(field="rcv_po_sn", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=18,
-                           error_msg="{}长度超过{}".format('rcv_po_sn', 18)
-                       )
-                       ),
-
-        ValidationRule(field="rcv_po_items", required=False, field_type=int
-                       ),
-
-        ValidationRule(field="reserved1", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reserved1', 255)
-                       )
-                       ),
-        ValidationRule(field="reserved2", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reserved2', 255)
-                       )
-                       ),
-        ValidationRule(field="reserved3", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=255,
-                           error_msg="{}长度超过{}".format('reserved3', 255)
-                       )
-                       ),
-        ValidationRule(field="reserved4", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved4', 30)
-                       )
-                       ),
-        ValidationRule(field="reserved5", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved5', 30)
-                       )
-                       ),
-        ValidationRule(field="reserved6", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved6', 30)
-                       )
-                       ),
-        ValidationRule(field="reserved7", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved7', 30)
-                       )
-                       ),
-        ValidationRule(field="reserved8", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved8', 30)
-                       )
-                       ),
-        ValidationRule(field="reserved9", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved9', 30)
-                       )
-                       ),
-        ValidationRule(field="reserved10", required=False, field_type=str,
-                       length=LengthValidation(
-                           enabled=True,
-                           operator=LengthOperator.LE,
-                           value=30,
-                           error_msg="{}长度超过{}".format('reserved10', 30)
-                       )
-                       )
-        ,
-        ValidationRule(field="price",
-                       required_func=cache_cls.check_price_bt,
-                       required_func_depend=['rel_po_sn'],
-                       field_type=list
-                       )
-
+        ValidationRule(
+            field="rcv_project_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=32,
+                error_msg="{}长度超过{}".format("rcv_project_sn", 32),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_vendor_code",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=20,
+                error_msg="{}长度超过{}".format("rcv_vendor_code", 20),
+            ),
+        ),
+        ValidationRule(
+            field="rcv_po_sn",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=18,
+                error_msg="{}长度超过{}".format("rcv_po_sn", 18),
+            ),
+        ),
+        ValidationRule(field="rcv_po_items", required=False, field_type=int),
+        ValidationRule(
+            field="reserved1",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reserved1", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reserved2",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reserved2", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reserved3",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=255,
+                error_msg="{}长度超过{}".format("reserved3", 255),
+            ),
+        ),
+        ValidationRule(
+            field="reserved4",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved4", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved5",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved5", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved6",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved6", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved7",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved7", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved8",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved8", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved9",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved9", 30),
+            ),
+        ),
+        ValidationRule(
+            field="reserved10",
+            required=False,
+            field_type=str,
+            length=LengthValidation(
+                enabled=True,
+                operator=LengthOperator.LE,
+                value=30,
+                error_msg="{}长度超过{}".format("reserved10", 30),
+            ),
+        ),
+        ValidationRule(
+            field="price",
+            required_func=cache_cls.check_price_bt,
+            required_func_depend=["rel_po_sn"],
+            field_type=list,
+        ),
     ]
     header_validator = DynamicListValidator(header_rules)
     item_validator = DynamicListValidator(item_rules)
 
     is_valid, results, all_count, pass_count = header_validator.validate(doc_data)
-    if len(results) == 1 and isinstance(results[0], ValidationResult):
-        return 0, 0, [], [], [], results[0].__dict__.get('errors', [None])[0]
+    if (
+        len(results) == 1
+        and isinstance(results[0], ValidationResult)
+        and not results[0].is_valid
+    ):
+        _r = results[0]
+        return 0, 0, [], [], [], (_r.type_errors or _r.errors or [None])[0]
     items_data = []
     all_count = 0
     pass_count = 0
     insert_header_data = []
     insert_items_data = []
     for doc_item in doc_data:
-        items_data = copy.deepcopy(doc_item['item'])
-        message_text = doc_item['message_text']
-        doc_item.pop('item')
-        doc_item.pop('message_text')
+        items_data = copy.deepcopy(doc_item["item"])
+        message_text = doc_item["message_text"]
+        doc_item.pop("item")
+        doc_item.pop("message_text")
 
-        if doc_item['document_status'] == 2:
-            item_is_valid, item_results, item_all_count, item_pass_count = item_validator.validate(items_data)
+        if doc_item["document_status"] == 2:
+            item_is_valid, item_results, item_all_count, item_pass_count = (
+                item_validator.validate(items_data)
+            )
 
-            if len(item_results) == 1 and isinstance(item_results[0], ValidationResult):
-                return 0, 0, [], [], [], item_results[0].__dict__.get('errors', [None])[0]
+            if (
+                len(item_results) == 1
+                and isinstance(item_results[0], ValidationResult)
+                and not item_results[0].is_valid
+            ):
+                _r = item_results[0]
+                return 0, 0, [], [], [], (_r.type_errors or _r.errors or [None])[0]
 
             if item_is_valid:
                 insert_header_data.append(doc_item)
@@ -2447,7 +2730,6 @@ def posting_platform_reversal(external_sys_md_data):
                             reverse_data_ls,count_msg = f"冲销执行完成：总共 {all_count}条,通过{pass_count}条,未通过{all_count - pass_count}条")
     else:
         return ResponseData(ResponseStatusCode.Error, f"无数据，请检查", external_sys_md_data)
-
 
 
 def reversal_md_doc(user_id, re_mat_doc_sn, mat_doc_year, posting_date):

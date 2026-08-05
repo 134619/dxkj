@@ -568,8 +568,9 @@ class DbHelper:
             else:
                 if status < 0:
                     raise SfException(str(status), [])
-
         return status
+
+
 
     def batchDeleteToDB(self, tableName, ids: List[str], **kwargs):
         ids = ",".join(ids)
